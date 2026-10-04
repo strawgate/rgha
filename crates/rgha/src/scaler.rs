@@ -20,6 +20,8 @@ use crate::pool::{Departed, Pool, State};
 
 /// How often to look for instances the pool doesn't know about.
 const RECONCILE_EVERY: Duration = Duration::from_secs(5 * 60);
+/// How long to wait for JobCompleted after a busy runner's instance exits.
+const EXIT_GRACE: Duration = Duration::from_secs(120);
 /// Attempts per runner within one poll before deferring to backoff.
 const START_ATTEMPTS: u32 = 3;
 
@@ -186,23 +188,37 @@ impl ClassScaler {
     }
 
     fn drain_events(&mut self) {
+        let now = Instant::now();
         while let Ok(Event::Exited { name, code, timed_out }) = self.events_rx.try_recv() {
-            if let Some(d) = self.pool.remove(&name, Instant::now()) {
-                let why = if timed_out { "timed out" } else { "instance exited" };
-                tracing::info!(class = %self.class.name, runner = %name, ?code, why, "runner instance ended");
-                self.record(&d, why, None);
-                // A runner that died before taking a job is still registered.
-                let client = self.client.clone();
-                let id = d.runner.runner_id;
-                tokio::spawn(async move {
-                    if let Err(e) = client.remove_runner(id).await
-                        && e.status() != Some(404)
-                    {
-                        tracing::debug!(runner_id = id, error = %e, "remove_runner after exit");
-                    }
-                });
+            // A runner exits right after finishing its job, often before the
+            // JobCompleted message arrives. Let that message record the job.
+            if !timed_out && self.pool.mark_exited(&name, now) {
+                tracing::debug!(class = %self.class.name, runner = %name, ?code, "busy runner exited; awaiting JobCompleted");
+                continue;
             }
+            self.depart_exited(&name, code, timed_out);
         }
+        for name in self.pool.stale_exited(EXIT_GRACE, now) {
+            self.depart_exited(&name, None, false);
+        }
+    }
+
+    /// Removes a runner whose instance ended without a JobCompleted.
+    fn depart_exited(&mut self, name: &str, code: Option<i32>, timed_out: bool) {
+        let Some(d) = self.pool.remove(name, Instant::now()) else { return };
+        let why = if timed_out { "timed out" } else { "instance exited" };
+        tracing::info!(class = %self.class.name, runner = %name, ?code, why, "runner instance ended");
+        self.record(&d, why, None);
+        // A runner that died before taking a job is still registered.
+        let client = self.client.clone();
+        let id = d.runner.runner_id;
+        tokio::spawn(async move {
+            if let Err(e) = client.remove_runner(id).await
+                && e.status() != Some(404)
+            {
+                tracing::debug!(runner_id = id, error = %e, "remove_runner after exit");
+            }
+        });
     }
 
     async fn start_runners(&mut self, n: usize) {

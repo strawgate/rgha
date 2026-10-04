@@ -21,6 +21,10 @@ pub struct Runner {
     pub created: Instant,
     pub idle_since: Instant,
     pub job_started: Option<Instant>,
+    /// Set when the instance exited while busy, before GitHub's JobCompleted
+    /// arrived; the runner stays in the pool until that message (or a grace
+    /// period) so the job is recorded with its real result.
+    pub exited_at: Option<Instant>,
 }
 
 /// What happened to a runner that left the pool, for cost accounting.
@@ -77,8 +81,30 @@ impl Pool {
                 created: now,
                 idle_since: now,
                 job_started: None,
+                exited_at: None,
             },
         );
+    }
+
+    /// Records that a busy runner's instance has exited. Returns false if
+    /// the runner is unknown or idle (the caller should remove it instead).
+    pub fn mark_exited(&mut self, name: &str, now: Instant) -> bool {
+        match self.runners.get_mut(name) {
+            Some(r) if r.state == State::Busy => {
+                r.exited_at.get_or_insert(now);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Exited runners whose JobCompleted hasn't arrived within `grace`.
+    pub fn stale_exited(&self, grace: Duration, now: Instant) -> Vec<String> {
+        self.runners
+            .values()
+            .filter(|r| r.exited_at.is_some_and(|t| now.saturating_duration_since(t) >= grace))
+            .map(|r| r.name.clone())
+            .collect()
     }
 
     /// Marks a runner busy. Returns false for runners we don't own.
@@ -96,9 +122,11 @@ impl Pool {
     /// Removes a runner (job completed, instance exited, or reaped).
     pub fn remove(&mut self, name: &str, now: Instant) -> Option<Departed> {
         let runner = self.runners.remove(name)?;
+        // If the instance already exited, that is when billing stopped.
+        let end = runner.exited_at.unwrap_or(now);
         Some(Departed {
-            lifetime: now.saturating_duration_since(runner.created),
-            job: runner.job_started.map(|s| now.saturating_duration_since(s)),
+            lifetime: end.saturating_duration_since(runner.created),
+            job: runner.job_started.map(|s| end.saturating_duration_since(s)),
             runner,
         })
     }
@@ -150,6 +178,23 @@ mod tests {
         assert_eq!(p.desired(0), 2);
         assert_eq!(p.desired(10), 3);
         assert_eq!(p.desired(-5), 2);
+    }
+
+    #[test]
+    fn exit_before_job_completed_waits_for_the_message() {
+        let t0 = Instant::now();
+        let mut p = Pool::new(0, 5);
+        p.insert("idle".into(), 1, "i".into(), t0);
+        p.insert("busy".into(), 2, "j".into(), t0);
+        p.job_started("busy", t0);
+        assert!(!p.mark_exited("idle", t0), "idle runners are removed directly");
+        assert!(p.mark_exited("busy", t0 + Duration::from_secs(10)));
+        assert!(p.stale_exited(Duration::from_secs(120), t0 + Duration::from_secs(60)).is_empty());
+        assert_eq!(p.stale_exited(Duration::from_secs(120), t0 + Duration::from_secs(130)), vec!["busy".to_string()]);
+        // JobCompleted removes it later; durations end at the exit.
+        let d = p.remove("busy", t0 + Duration::from_secs(20)).unwrap();
+        assert_eq!(d.job, Some(Duration::from_secs(10)));
+        assert_eq!(d.lifetime, Duration::from_secs(10));
     }
 
     #[test]

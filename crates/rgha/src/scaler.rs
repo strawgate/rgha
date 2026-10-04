@@ -24,6 +24,8 @@ const RECONCILE_EVERY: Duration = Duration::from_secs(5 * 60);
 const EXIT_GRACE: Duration = Duration::from_secs(120);
 /// Attempts per runner within one poll before deferring to backoff.
 const START_ATTEMPTS: u32 = 3;
+/// Base delay between start attempts (doubled each retry).
+const RETRY_BASE_MS: u64 = if cfg!(test) { 1 } else { 500 };
 
 #[derive(Debug)]
 enum Event {
@@ -465,7 +467,7 @@ async fn start_with_retry(
     let mut last = None;
     for attempt in 0..START_ATTEMPTS {
         if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+            tokio::time::sleep(Duration::from_millis(RETRY_BASE_MS * (1 << attempt))).await;
         }
         let name = if attempt == 0 { name.clone() } else { format!("{name}-{attempt}") };
         match start_one(client.clone(), backend.clone(), scale_set_id, class, name).await {
@@ -574,3 +576,7 @@ mod tests {
         assert!(b.ready(t0));
     }
 }
+
+#[cfg(test)]
+#[path = "scaler_tests.rs"]
+mod integration_tests;

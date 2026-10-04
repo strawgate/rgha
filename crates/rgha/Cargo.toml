@@ -32,7 +32,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
-rustls.workspace = true
 proptest.workspace = true
 wiremock.workspace = true
 

@@ -2290,6 +2290,7 @@ dependencies = [
  "reqwest",
  "rgha-modal",
  "rgha-scaleset",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

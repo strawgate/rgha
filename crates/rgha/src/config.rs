@@ -401,12 +401,6 @@ impl Config {
                     c.backend
                 );
             }
-            if matches!(backend, BackendConfig::Firecracker { .. }) && c.network != NetworkMode::Open {
-                bail!(
-                    "class {:?}: network restrictions for the firecracker backend are not implemented yet (strawgate/rgha#22)",
-                    c.name
-                );
-            }
             if let BackendConfig::Docker { runtime, allow_insecure_runc, .. } = backend {
                 let isolated = runtime.as_deref().is_some_and(|r| r != "runc");
                 if c.policy.trust == crate::policy::Trust::Untrusted && !isolated && !allow_insecure_runc {

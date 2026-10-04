@@ -6,6 +6,7 @@ mod backend;
 mod config;
 mod controller;
 mod cost;
+mod egress;
 mod image;
 mod lab;
 mod metrics;

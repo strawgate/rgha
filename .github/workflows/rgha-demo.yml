@@ -1,8 +1,19 @@
-# Manually-triggered smoke job that runs on an rgha-managed sandbox.
+# Smoke jobs that run on rgha-managed sandboxes.
+#  - workflow_dispatch: run the tiny job, and optionally Docker-in-job on the
+#    trusted VM-runtime class.
+#  - pull_request touching .github/rgha-policy-probe: targets the trusted class
+#    on purpose; rgha's policy cancels the run (PR code never reaches it).
 name: rgha-demo
 
 on:
   workflow_dispatch:
+    inputs:
+      docker:
+        description: Also run Docker-in-job on rgha-docker
+        type: boolean
+        default: false
+  pull_request:
+    paths: [".github/rgha-policy-probe"]
 
 permissions:
   contents: read
@@ -28,3 +39,15 @@ jobs:
           else
             echo "blocked as expected"
           fi
+
+  docker:
+    if: github.event_name == 'pull_request' || inputs.docker
+    runs-on: rgha-docker
+    timeout-minutes: 10
+    steps:
+      - name: Kernel
+        run: uname -a
+      - name: Docker works inside the job
+        run: |
+          docker version
+          docker run --rm hello-world

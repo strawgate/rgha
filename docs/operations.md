@@ -198,19 +198,28 @@ memory_mib = 2048    # guest RAM = memory_limit_mib or memory_mib
 
 **How it works:**
 - **Rootfs:** built from the image, `preload` and the guest init, converted to
-  ext4, and cached under `state_dir` by content hash. The first build takes
-  minutes; later starts reuse it. Docker `ENV` is recorded into
-  `/etc/rgha/image.env` and re-applied in the guest.
-- **Registration token:** each VM gets a copy of the rootfs, and the
-  single-use JIT config arrives on a read-only raw drive, not the kernel
-  command line.
+  ext4, cached under `state_dir` by content hash, and shared **read-only** by
+  all VMs. Each VM gets a sparse scratch disk; the guest init overlays it on
+  the rootfs and pivots into the overlay. Docker `ENV` is recorded into
+  `/etc/rgha/image.env` and re-applied in the guest. Stale rootfs images and
+  snapshots are removed at startup.
+- **Snapshot boot** (`snapshots = true`, the default): for each VM shape (vCPUs,
+  memory), rgha boots a template VM until it waits for its config, then takes
+  a memory snapshot. This takes about 6 s, once, and is cached on disk. Jobs
+  restore the snapshot: VMGenID reseeds the guest kernel RNG, and
+  `clock_realtime` corrects the clock. No per-job identity exists in the
+  snapshot. If a restore fails, the VM cold-boots.
+- **Registration token:** the single-use JIT config arrives on a read-only
+  raw drive (read with `O_DIRECT`, so restored clones never see stale data),
+  not the kernel command line.
 - **Shutdown:** the guest powers off when the runner exits. rgha then removes
   the tap device and disk, and keeps the console log under `state_dir/logs`.
 - **Restarts:** VM state lives in `state_dir/vms`. A restarted controller
   adopts VMs that are still running and cleans up those that have exited.
 
-**Network isolation:** each VM gets a tap device and a /30 with NAT out of the
-uplink. Rules live in dedicated `RGHA-FWD` / `RGHA-NAT` chains;
+**Network isolation:** each VM runs in its own network namespace with an
+identical internal tap and guest address, which snapshot restore requires.
+That is NATed onto a unique veth /30 and then out of the uplink. Rules live in dedicated `RGHA-FWD` / `RGHA-NAT` chains;
 `RGHA-FWD` is inserted into `DOCKER-USER` when Docker is present. Guests
 cannot reach the host, RFC1918 ranges (your other VMs, Docker networks, LAN),
 CGNAT, or link-local/metadata addresses. Egress allowlists
@@ -219,10 +228,15 @@ rules:
 `iptables -D DOCKER-USER -j RGHA-FWD; iptables -D INPUT -i rgha+ -j DROP;
 iptables -t nat -D POSTROUTING -j RGHA-NAT`.
 
-**Measured** (on a host loaded at 74/72 cores, so timings are pessimistic):
-- The guest kernel reaches init in 0.8 s, and the runner is listening about 4 s after VM start.
-- Copying the rootfs per VM takes 2.3 s alone and contends when several VMs
-  start at once; copy-on-write and snapshot boots are tracked in strawgate/rgha#24.
+**Measured** (on a host loaded at 40–74 on 72 cores, so timings are pessimistic):
+
+| | Cold boot, rootfs copied per VM | Snapshot restore, shared rootfs |
+|---|---|---|
+| VM start (`boot_ms`: JIT config, namespace, disks, restore) | 2.3 s alone; 8.4 s for 3 concurrent | **1.1–1.4 s** for 4 concurrent |
+| Pickup (job assigned → runner took it) | 13.7–14.6 s | **5.3–5.7 s** |
+
+After a restore, the runner process start and its GitHub session take about
+3 s; that's the remaining floor.
 - Verified: shell, `setup-node`/npm, `setup-python`/PyPI and boot-profile jobs
   ran in jailed microVMs (uid 10000, chroot); private ranges were blocked;
   and a controller `kill -9` mid-job left no orphans.

@@ -1,15 +1,38 @@
 #!/bin/bash
-# rgha guest init for Firecracker microVMs (runs as PID 1).
+# rgha guest init for Firecracker microVMs.
 #
-# The kernel brings up eth0 from the `ip=` boot argument. The runner's
-# single-use JIT config arrives on the second drive (/dev/vdb, raw, NUL
-# padded) so it never appears on the kernel command line. The VM powers off
-# when the runner exits; Firecracker then exits, which tells rgha the
-# runner is done.
+# Stage 1 (PID 1, read-only root): mount the per-VM scratch disk (/dev/vdc),
+# build an overlay with the shared read-only rootfs as the lower layer, and
+# pivot into it. Stage 2: wait for the per-job config on the second drive
+# (/dev/vdb), set the clock, run the runner once, power off.
+#
+# A snapshot template is taken while stage 2 waits for its config, before
+# any per-job state exists; each job restores the snapshot and then finds
+# its config on /dev/vdb. Reads use O_DIRECT so a restored guest never sees
+# a stale cached copy of the drive.
+#
+# The JIT config never appears on the kernel command line. Docker ENV is
+# recorded at image build time in /etc/rgha/image.env.
 
-# The kernel starts init with no PATH; Docker ENV is lost when the image is
-# exported to a rootfs, so it is recorded at build time in /etc/rgha/image.env.
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+if [ "${1:-}" != "stage2" ]; then
+  mount -t devtmpfs dev /dev 2>/dev/null
+  mount -t proc proc /proc
+  if [ -b /dev/vdc ]; then
+    mount -t ext4 -o noatime /dev/vdc /mnt/scratch
+    mkdir -p /mnt/scratch/upper /mnt/scratch/work /mnt/scratch/docker
+    mount -t overlay overlay -o lowerdir=/,upperdir=/mnt/scratch/upper,workdir=/mnt/scratch/work /mnt/newroot
+    mkdir -p /mnt/newroot/oldroot
+    umount /proc
+    cd /mnt/newroot
+    pivot_root . oldroot
+    exec chroot . /sbin/rgha-init stage2
+  fi
+  umount /proc
+  exec /sbin/rgha-init stage2
+fi
+
 if [ -f /etc/rgha/image.env ]; then
   while IFS= read -r line; do
     [ -n "$line" ] && export "$line"
@@ -25,17 +48,34 @@ mount -t tmpfs tmpfs /dev/shm
 mount -t tmpfs tmpfs /run
 mount -t tmpfs tmpfs /tmp
 mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null
+if [ -d /oldroot/mnt/scratch/docker ]; then
+  mkdir -p /var/lib/docker
+  mount --bind /oldroot/mnt/scratch/docker /var/lib/docker
+fi
+umount -l /oldroot 2>/dev/null
 hostname rgha
 ip link set lo up 2>/dev/null
 
 dns=$(sed -n 's/.*rgha.dns=\([^ ]*\).*/\1/p' /proc/cmdline)
 echo "nameserver ${dns:-1.1.1.1}" > /etc/resolv.conf
 
-echo "rgha-init: up after $(cut -d' ' -f1 /proc/uptime)s"
-JIT=""
-if [ -b /dev/vdb ]; then
-  JIT=$(tr -d '\000' < /dev/vdb)
+# Config drive: "rgha1 <epoch seconds>\n<jit config>\n", NUL padded.
+read_config() { dd if=/dev/vdb iflag=direct bs=4096 count=16 2>/dev/null | tr -d '\000'; }
+CONFIG=$(read_config)
+if [ -z "$CONFIG" ]; then
+  sync
+  echo "rgha-init: waiting for config"
+  while [ -z "$CONFIG" ]; do
+    sleep 0.01
+    CONFIG=$(read_config)
+  done
 fi
+echo "rgha-init: config after $(cut -d' ' -f1 /proc/uptime)s"
+
+header=$(printf '%s\n' "$CONFIG" | head -1)
+JIT=$(printf '%s\n' "$CONFIG" | sed -n 2p)
+epoch=${header#rgha1 }
+[ "$epoch" != "$header" ] && date -s "@$epoch" > /dev/null 2>&1
 
 # Optional hook run as root before the runner (e.g. starting dockerd).
 if [ -x /etc/rgha/pre-runner ]; then

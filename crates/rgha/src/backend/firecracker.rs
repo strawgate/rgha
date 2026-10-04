@@ -668,6 +668,8 @@ impl Inner {
                 tokio::fs::rename(layout.files.join(f), staging.join(f)).await?;
                 run("chmod", &["0644", staging.join(f).to_str().unwrap()]).await?;
             }
+            let rootfs_name = rootfs.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+            tokio::fs::write(staging.join("rootfs"), rootfs_name).await?;
             tokio::fs::write(staging.join("ready"), b"").await?;
             let _ = tokio::fs::remove_dir_all(&dir).await;
             tokio::fs::rename(&staging, &dir).await?;
@@ -716,7 +718,33 @@ impl Inner {
         self.adopt_existing().await?;
         self.rootfs.get_or_try_init(|| self.build_rootfs()).await?;
         self.scratch.get_or_try_init(|| self.build_scratch()).await?;
+        self.gc().await;
         Ok(())
+    }
+
+    /// Removes rootfs images and snapshot templates built for other
+    /// configurations (they're large; a rootfs rebuild orphans them).
+    async fn gc(&self) {
+        let Some(current) = self.rootfs.get().and_then(|p| p.file_name()).and_then(|n| n.to_str()).map(str::to_string)
+        else {
+            return;
+        };
+        let Ok(mut dir) = tokio::fs::read_dir(&self.s.state_dir).await else { return };
+        while let Ok(Some(e)) = dir.next_entry().await {
+            let name = e.file_name().to_string_lossy().to_string();
+            let stale = if name.starts_with("rootfs-") && name.ends_with(".ext4") {
+                name != current
+            } else if name.starts_with("snap-") {
+                tokio::fs::read_to_string(e.path().join("rootfs")).await.map(|r| r != current).unwrap_or(true)
+            } else {
+                false
+            };
+            if stale {
+                tracing::info!(path = %e.path().display(), "removing stale Firecracker artifact");
+                let _ = tokio::fs::remove_dir_all(e.path()).await;
+                let _ = tokio::fs::remove_file(e.path()).await;
+            }
+        }
     }
 
     async fn do_start(self: &Arc<Self>, spec: &RunnerSpec) -> anyhow::Result<String> {

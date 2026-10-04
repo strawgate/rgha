@@ -72,6 +72,8 @@ struct Meta {
 struct Vm {
     meta: Meta,
     exit: watch::Receiver<Option<i32>>,
+    /// Started by a previous controller process (no waiter task).
+    adopted: bool,
 }
 
 pub struct FirecrackerBackend(Arc<Inner>);
@@ -340,6 +342,21 @@ impl Inner {
         self.free_slot(meta.slot);
     }
 
+    /// Cleans up adopted VMs (no waiter task) whose Firecracker process has
+    /// exited since adoption. Called on every reconcile via `list`.
+    async fn sweep_dead_adopted(&self) {
+        let dead: Vec<Meta> = {
+            let mut vms = self.vms.lock().expect("vms lock");
+            let ids: Vec<String> =
+                vms.iter().filter(|(_, v)| v.adopted && !pid_alive(v.meta.pid)).map(|(id, _)| id.clone()).collect();
+            ids.into_iter().filter_map(|id| vms.remove(&id)).map(|v| v.meta).collect()
+        };
+        for meta in dead {
+            tracing::info!(vm = %meta.id, "cleaning up exited VM adopted from a previous controller");
+            self.cleanup(&meta).await;
+        }
+    }
+
     /// Adopts VMs left by a previous controller process: live ones are
     /// tracked (so reconcile can decide), dead ones are cleaned up.
     async fn adopt_existing(&self) -> anyhow::Result<()> {
@@ -354,7 +371,7 @@ impl Inner {
             if pid_alive(meta.pid) {
                 let (tx, rx) = watch::channel(None);
                 std::mem::forget(tx); // never resolves; stop() kills by pid
-                self.vms.lock().expect("vms lock").insert(meta.id.clone(), Vm { meta, exit: rx });
+                self.vms.lock().expect("vms lock").insert(meta.id.clone(), Vm { meta, exit: rx, adopted: true });
             } else {
                 self.cleanup(&meta).await;
             }
@@ -427,8 +444,12 @@ impl Inner {
         {
             run_ok("kill", &["-9", &pid.to_string()]).await;
         }
-        // Orphans adopted from a previous process have no waiter task.
-        let adopted = self.vms.lock().expect("vms lock").remove(id).filter(|v| v.exit.borrow().is_none());
+        // Orphans adopted from a previous process have no waiter task to
+        // clean up after them; ours clean up when the process exits.
+        let adopted = {
+            let mut vms = self.vms.lock().expect("vms lock");
+            if vms.get(id).is_some_and(|v| v.adopted) { vms.remove(id) } else { None }
+        };
         if let Some(vm) = adopted {
             self.cleanup(&vm.meta).await;
         }
@@ -450,6 +471,7 @@ impl Inner {
     }
 
     async fn do_list(&self, class: &str) -> anyhow::Result<Vec<Instance>> {
+        self.sweep_dead_adopted().await;
         Ok(self
             .vms
             .lock()
@@ -566,7 +588,7 @@ impl Inner {
 
         let (tx, rx) = watch::channel(None);
         let cleanup_meta: Meta = serde_json::from_slice(&serde_json::to_vec(&meta)?)?;
-        self.vms.lock().expect("vms lock").insert(id.to_string(), Vm { meta, exit: rx });
+        self.vms.lock().expect("vms lock").insert(id.to_string(), Vm { meta, exit: rx, adopted: false });
 
         // Waiter: VM exit = runner done. Keep the console log, then clean up.
         let inner = Arc::clone(self);
@@ -578,6 +600,8 @@ impl Inner {
             let _ = tokio::fs::copy(console, logs.join(format!("{}.log", cleanup_meta.id))).await;
             inner.cleanup(&cleanup_meta).await;
             let _ = tx.send(Some(code));
+            // Receivers already handed out keep the exit code.
+            inner.vms.lock().expect("vms lock").remove(&cleanup_meta.id);
         });
         Ok(())
     }

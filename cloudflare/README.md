@@ -26,6 +26,27 @@ Costs: CPU from inside the VM (`/proc/stat`), times Cloudflare list prices
 container's lifetime. The ranges cover the setup-python download, which Modal's
 preloaded image skips.
 
+## Mostly idle jobs (2026-10-04, testbed `idle` workflow)
+
+The job polls the GitHub API every 15 s for 5 minutes, like a "wait for other
+jobs or a deploy" check. All three ran at the same time:
+
+| Backend | Pickup | In-VM CPU | Billed for the 5-min job | Per idle minute | vs GitHub |
+|---|---|---|---|---|---|
+| GitHub-hosted 2-core (6 billed minutes) | 3–5 s | — | $0.036 | $0.006 | — |
+| Modal `rgha-tiny` (0.125 core, 128 MiB) | 4 s | 3.3 CPU-s | $0.0018, metered at the request floor | $0.00035 | ~20× |
+| Cloudflare `basic` (1/4 vCPU, 1 GiB) | 6 s | 3.1 CPU-s | ~$0.0011 | ~$0.00019 | ~33× |
+| Cloudflare `lite` (1/16 vCPU, 256 MiB) | 6 s | 4.7 CPU-s | ~$0.00047 | ~$0.00008 | ~77× |
+
+Cloudflare costs come from usage analytics, which matched the container's
+lifetime and in-VM CPU for these 5-minute jobs. On Modal, a waiting job is
+billed at its CPU request. On Cloudflare, idle CPU is free and the cost is
+the memory and disk of the instance type.
+
+`lite` needs `Dockerfile.slim` (1.2 GB). The official runner image is 2.5 GB
+and `lite` has a 2 GB disk. At 1/16 vCPU, any real work is ~16× slower, so
+`lite` is only for jobs that wait.
+
 ## What differs from Modal
 
 - **CPU costs half as much and is billed only when used, but it can't burst
@@ -41,5 +62,8 @@ preloaded image skips.
 - **Analytics can't price single jobs.** `containersUsageAdaptiveGroups` and
   `containersMetricsAdaptiveGroups` are sampled and missed most of the CPU of
   sub-minute jobs (e.g. 6–16 CPU-s recorded for ~110 used).
+- **Durable Objects are evicted while a container runs.** That drops the
+  `monitor()` promise, so the Worker re-checks the container from an alarm
+  every 10 s to record when it exits.
 - **Starts fail during a rollout.** After `wrangler deploy`, starts failed with
   `internal error` until every class reported `ready`, which took a few minutes.

@@ -8,6 +8,7 @@
   "compatibility_date": "2026-09-01",
   "observability": { "enabled": true },
   "containers": [
+    { "class_name": "RunnerLite", "image": "./Dockerfile.slim", "instance_type": "lite", "max_instances": 10 },
     { "class_name": "RunnerBasic", "image": "./Dockerfile", "instance_type": "basic", "max_instances": 10 },
     { "class_name": "RunnerStandard1", "image": "./Dockerfile", "instance_type": "standard-1", "max_instances": 10 },
     { "class_name": "RunnerStandard2", "image": "./Dockerfile", "instance_type": "standard-2", "max_instances": 4 },
@@ -15,6 +16,7 @@
   ],
   "durable_objects": {
     "bindings": [
+      { "name": "RUNNER_LITE", "class_name": "RunnerLite" },
       { "name": "RUNNER_BASIC", "class_name": "RunnerBasic" },
       { "name": "RUNNER_STANDARD_1", "class_name": "RunnerStandard1" },
       { "name": "RUNNER_STANDARD_2", "class_name": "RunnerStandard2" },
@@ -23,6 +25,7 @@
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Runner"] },
-    { "tag": "v2", "new_sqlite_classes": ["RunnerBasic", "RunnerStandard1", "RunnerStandard2", "RunnerStandard4"], "deleted_classes": ["Runner"] }
+    { "tag": "v2", "new_sqlite_classes": ["RunnerBasic", "RunnerStandard1", "RunnerStandard2", "RunnerStandard4"], "deleted_classes": ["Runner"] },
+    { "tag": "v3", "new_sqlite_classes": ["RunnerLite"] }
   ]
 }

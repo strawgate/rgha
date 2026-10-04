@@ -11,6 +11,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 interface Env {
+  RUNNER_LITE: DurableObjectNamespace<Runner>;
   RUNNER_BASIC: DurableObjectNamespace<Runner>;
   RUNNER_STANDARD_1: DurableObjectNamespace<Runner>;
   RUNNER_STANDARD_2: DurableObjectNamespace<Runner>;
@@ -19,6 +20,7 @@ interface Env {
 }
 
 const SIZES = {
+  lite: (e: Env) => e.RUNNER_LITE,
   basic: (e: Env) => e.RUNNER_BASIC,
   "standard-1": (e: Env) => e.RUNNER_STANDARD_1,
   "standard-2": (e: Env) => e.RUNNER_STANDARD_2,
@@ -35,6 +37,9 @@ type Status = {
 };
 
 const MAX_JOB_MS = 6 * 60 * 60 * 1000;
+// The DO can be evicted while its container runs, dropping monitor(); an
+// alarm re-checks the container so the exit time is still recorded.
+const CHECK_MS = 10_000;
 
 class Runner extends DurableObject<Env> {
   async begin(jit: string, instance?: string): Promise<Status> {
@@ -49,6 +54,7 @@ class Runner extends DurableObject<Env> {
       entrypoint: ["/home/runner/rgha-entrypoint.sh"],
       env: { ACTIONS_RUNNER_INPUT_JITCONFIG: jit },
     });
+    await this.ctx.storage.setAlarm(Date.now() + CHECK_MS);
     this.ctx.waitUntil(
       c.monitor().then(
         () => this.finish({ state: "exited" }),
@@ -58,8 +64,17 @@ class Runner extends DurableObject<Env> {
     return st;
   }
 
+  async alarm() {
+    const st = await this.ctx.storage.get<Status>("status");
+    if (st?.state !== "running") return;
+    if (this.ctx.container!.running) await this.ctx.storage.setAlarm(Date.now() + CHECK_MS);
+    else await this.finish({ state: "exited" });
+  }
+
+  /** Records the end once; later calls (monitor and alarm both fire) keep the first time. */
   async finish(patch: Partial<Status>) {
     const st = ((await this.ctx.storage.get<Status>("status")) ?? { state: "idle" }) as Status;
+    if (st.ended_ms && st.state !== "running") return;
     await this.ctx.storage.put("status", { ...st, ...patch, ended_ms: Date.now() });
   }
 
@@ -85,6 +100,7 @@ function authorized(req: Request, env: Env): boolean {
   return diff === 0;
 }
 
+export class RunnerLite extends Runner {}
 export class RunnerBasic extends Runner {}
 export class RunnerStandard1 extends Runner {}
 export class RunnerStandard2 extends Runner {}

@@ -1,0 +1,13 @@
+# Minimal runner image for the 2 GB-disk "lite" instance type (the official
+# actions-runner image is ~2.5 GB). Ubuntu + the runner tarball + its deps.
+FROM ubuntu:24.04
+ARG RUNNER_VERSION=2.337.0
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git jq sudo libicu74 libssl3 \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -m -s /bin/bash runner && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner
+USER runner
+WORKDIR /home/runner
+RUN curl -fsSL https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz | tar xz
+COPY --chmod=755 entrypoint.sh /home/runner/rgha-entrypoint.sh

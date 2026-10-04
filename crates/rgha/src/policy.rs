@@ -51,13 +51,30 @@ pub struct Policy {
     /// are still rejected.
     #[serde(default)]
     pub allow_same_repo_prs: bool,
+    /// GitHub logins allowed to run jobs on this class. Both the run's
+    /// `actor` (e.g. the PR author) and its `triggering_actor` (e.g. who
+    /// re-ran it) must be listed. Empty = anyone.
+    #[serde(default)]
+    pub allowed_actors: Vec<String>,
+    /// GitHub logins never allowed (as actor or triggering actor).
+    #[serde(default)]
+    pub denied_actors: Vec<String>,
 }
 
-/// What rgha learned about a job beyond the scale set message.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// What rgha learned about a job beyond the scale set message (from the
+/// REST workflow run, looked up only when the policy needs it).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JobContext {
     /// `Some(true)` if the PR head is in a fork; `None` if unknown/not looked up.
     pub fork: Option<bool>,
+    /// Who started and who triggered the run; `None` if unknown.
+    pub actors: Option<Actors>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Actors {
+    pub actor: String,
+    pub triggering: String,
 }
 
 pub fn is_pull_request_event(event: &str) -> bool {
@@ -75,11 +92,21 @@ impl Policy {
         self.allow_fork_prs.unwrap_or(self.trust == Trust::Untrusted)
     }
 
+    fn has_actor_rules(&self) -> bool {
+        !self.allowed_actors.is_empty() || !self.denied_actors.is_empty()
+    }
+
     /// True if the decision for this job depends on whether its PR is from a
-    /// fork, i.e. only then is the REST lookup worth making.
+    /// fork (actor rules aside).
     pub fn needs_fork_info(&self, job: &JobMessageBase) -> bool {
-        let accept = |fork| self.evaluate(job, JobContext { fork: Some(fork) }) == Decision::Acquire;
+        let p = Policy { allowed_actors: vec![], denied_actors: vec![], ..self.clone() };
+        let accept = |fork| p.evaluate(job, JobContext { fork: Some(fork), actors: None }) == Decision::Acquire;
         is_pull_request_event(&job.event_name) && accept(false) != accept(true)
+    }
+
+    /// True if deciding needs the REST workflow run (fork status or actors).
+    pub fn needs_lookup(&self, job: &JobMessageBase) -> bool {
+        self.has_actor_rules() || self.needs_fork_info(job)
     }
 
     pub fn evaluate(&self, job: &JobMessageBase, ctx: JobContext) -> Decision {
@@ -111,6 +138,20 @@ impl Policy {
                 Some(false) => {}
                 Some(true) => return Decision::Reject("pull request from a fork".into()),
                 None => return Decision::Reject("could not verify the pull request is not from a fork".into()),
+            }
+        }
+        if self.has_actor_rules() {
+            let Some(a) = &ctx.actors else {
+                return Decision::Reject("could not verify who triggered the run".into());
+            };
+            let listed = |list: &[String], login: &str| list.iter().any(|l| l.eq_ignore_ascii_case(login));
+            for (who, login) in [("actor", &a.actor), ("triggering actor", &a.triggering)] {
+                if listed(&self.denied_actors, login) {
+                    return Decision::Reject(format!("{who} {login:?} is denied"));
+                }
+                if !self.allowed_actors.is_empty() && !listed(&self.allowed_actors, login) {
+                    return Decision::Reject(format!("{who} {login:?} is not in allowed_actors"));
+                }
             }
         }
         let repo = format!("{}/{}", job.owner_name, job.repository_name);
@@ -206,7 +247,33 @@ mod tests {
     }
 
     fn ctx(fork: Option<bool>) -> JobContext {
-        JobContext { fork }
+        JobContext { fork, actors: None }
+    }
+
+    fn by(actor: &str, triggering: &str) -> JobContext {
+        JobContext { fork: Some(false), actors: Some(Actors { actor: actor.into(), triggering: triggering.into() }) }
+    }
+
+    #[test]
+    fn actor_allowlist_checks_author_and_rerunner() {
+        let p = Policy { allowed_actors: vec!["strawgate".into()], ..Default::default() };
+        let push = job("push", MAIN);
+        let ok = |d: Decision| d == Decision::Acquire;
+        assert!(p.needs_lookup(&push), "actor rules always need the run");
+        assert!(ok(p.evaluate(&push, by("strawgate", "StrawGate"))), "case-insensitive");
+        assert!(!ok(p.evaluate(&push, by("someone", "someone"))));
+        assert!(!ok(p.evaluate(&push, by("someone", "strawgate"))), "maintainer re-running an outsider's run");
+        assert!(!ok(p.evaluate(&push, by("strawgate", "someone"))));
+        assert!(!ok(p.evaluate(&push, ctx(Some(false)))), "unknown actor fails closed");
+        let deny = Policy { denied_actors: vec!["mallory".into()], ..Default::default() };
+        assert!(ok(deny.evaluate(&push, by("alice", "alice"))));
+        assert!(!ok(deny.evaluate(&push, by("alice", "mallory"))));
+        // Fork detection still works alongside actor rules.
+        let both =
+            Policy { allowed_actors: vec!["strawgate".into()], allow_fork_prs: Some(false), ..Default::default() };
+        assert!(both.needs_fork_info(&job("pull_request", PR)));
+        let fork_by_us = JobContext { fork: Some(true), ..by("strawgate", "strawgate") };
+        assert!(!ok(both.evaluate(&job("pull_request", PR), fork_by_us)));
     }
 
     #[test]

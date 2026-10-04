@@ -15,7 +15,7 @@ use crate::backend::{Backend, Network, RunnerSpec};
 use crate::config::ClassConfig;
 use crate::cost::{Ledger, Pricing, github_hosted_cost};
 use crate::metrics;
-use crate::policy::{Decision, JobContext};
+use crate::policy::{Actors, Decision, JobContext};
 use crate::pool::{AdaptiveWarm, Departed, Pool, State};
 
 /// How often to look for instances the pool doesn't know about.
@@ -70,8 +70,9 @@ pub struct ClassScaler {
     /// so no runner is started that could pick them up.
     blocked: HashMap<String, Instant>,
     backoff: StartBackoff,
-    /// Fork status per workflow run id (only looked up when a policy needs it).
-    fork_cache: HashMap<i64, bool>,
+    /// Run facts (fork status, actors) per workflow run id, looked up only
+    /// when the class policy needs them.
+    run_cache: HashMap<i64, JobContext>,
     /// Runs already being cancelled (several rejected jobs can share a run).
     cancelled_runs: HashMap<i64, Instant>,
     last_reconcile: Option<Instant>,
@@ -114,7 +115,7 @@ impl ClassScaler {
             events_rx,
             blocked: HashMap::new(),
             backoff: StartBackoff::default(),
-            fork_cache: HashMap::new(),
+            run_cache: HashMap::new(),
             cancelled_runs: HashMap::new(),
             last_reconcile: None,
             last_activity: None,
@@ -147,18 +148,29 @@ impl ClassScaler {
     /// required, cached per run. A failed lookup leaves `fork = None`, which
     /// the policy treats as "not verified" (fail closed).
     async fn job_context(&mut self, job: &JobMessageBase) -> JobContext {
-        if !self.class.policy.needs_fork_info(job) {
+        if !self.class.policy.needs_lookup(job) {
             return JobContext::default();
         }
-        if let Some(fork) = self.fork_cache.get(&job.workflow_run_id) {
-            return JobContext { fork: Some(*fork) };
+        if let Some(ctx) = self.run_cache.get(&job.workflow_run_id) {
+            return ctx.clone();
         }
-        let mut fork = None;
         for attempt in 0..3u32 {
             match self.client.get_workflow_run(&job.owner_name, &job.repository_name, job.workflow_run_id).await {
                 Ok(run) => {
-                    fork = run.is_fork();
-                    break;
+                    let actors = run.actor.as_ref().map(|a| Actors {
+                        actor: a.login.clone(),
+                        triggering: run
+                            .triggering_actor
+                            .as_ref()
+                            .map(|t| t.login.clone())
+                            .unwrap_or_else(|| a.login.clone()),
+                    });
+                    let ctx = JobContext { fork: run.is_fork(), actors };
+                    if self.run_cache.len() > 10_000 {
+                        self.run_cache.clear();
+                    }
+                    self.run_cache.insert(job.workflow_run_id, ctx.clone());
+                    return ctx;
                 }
                 Err(e) => {
                     tracing::warn!(class = %self.class.name, run_id = job.workflow_run_id, attempt, error = %e, "workflow run lookup failed");
@@ -166,13 +178,8 @@ impl ClassScaler {
                 }
             }
         }
-        if let Some(f) = fork {
-            if self.fork_cache.len() > 10_000 {
-                self.fork_cache.clear();
-            }
-            self.fork_cache.insert(job.workflow_run_id, f);
-        }
-        JobContext { fork }
+        // Unknown facts: the policy rejects anything that depends on them.
+        JobContext::default()
     }
 
     /// Legacy flow: jobs offered as `JobAvailable` are only acquired if allowed.

@@ -23,8 +23,6 @@ impl Pricing {
     /// Daytona list prices per vCPU-second and GiB-second (daytona.io/pricing,
     /// checked 2026-10). Daytona allocates whole vCPUs and GiB.
     pub const DAYTONA: Pricing = Pricing { cpu_per_sec: 0.000_014, gib_per_sec: 0.000_004_5, min_billed_secs: 0.0 };
-    /// Local/self-hosted capacity is already paid for.
-    pub const FREE: Pricing = Pricing { cpu_per_sec: 0.0, gib_per_sec: 0.0, min_billed_secs: 0.0 };
 
     pub fn cost(&self, cpu: f64, memory_mib: u32, secs: f64) -> f64 {
         let billed = secs.max(self.min_billed_secs).max(0.0);

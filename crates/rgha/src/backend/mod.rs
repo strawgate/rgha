@@ -2,8 +2,6 @@
 //! running the official `actions/runner` with a single-use JIT config.
 
 mod daytona;
-mod docker;
-mod firecracker;
 mod modal;
 
 use std::sync::Arc;
@@ -14,8 +12,6 @@ use async_trait::async_trait;
 use crate::config::{BackendConfig, ClassConfig, GITHUB_RUNNER_DOMAINS, NetworkMode};
 
 pub use daytona::DaytonaBackend;
-pub use docker::DockerBackend;
-pub use firecracker::{FirecrackerBackend, FirecrackerSettings, JailerSettings};
 pub use modal::{ModalBackend, ModalSettings};
 
 /// Env var the official runner image reads its JIT config from.
@@ -114,17 +110,6 @@ pub fn modal_docker_commands() -> Vec<String> {
 
 pub use modal::sandbox_spec as modal_sandbox_spec;
 
-/// Parses `a.b.0.0/16` into the first two octets.
-pub fn parse_fc_subnet(s: &str) -> Result<[u8; 2], String> {
-    let (ip, len) = s.split_once('/').ok_or("subnet must look like 10.213.0.0/16")?;
-    let ip: std::net::Ipv4Addr = ip.parse().map_err(|_| format!("bad subnet address {ip:?}"))?;
-    let o = ip.octets();
-    if len != "16" || o[2] != 0 || o[3] != 0 {
-        return Err(format!("subnet {s:?} must be a /16 like 10.213.0.0/16"));
-    }
-    Ok([o[0], o[1]])
-}
-
 fn expand_home(path: &str) -> String {
     match (path.strip_prefix("~/"), std::env::var("HOME")) {
         (Some(rest), Ok(home)) => format!("{home}/{rest}"),
@@ -152,47 +137,6 @@ pub async fn build(name: &str, cfg: &BackendConfig) -> anyhow::Result<Arc<dyn Ba
                 .await?,
             )
         }
-        BackendConfig::Docker { image, runtime, bin, .. } => Arc::new(DockerBackend::new(bin, image, runtime.clone())),
-        BackendConfig::Firecracker {
-            image,
-            image_commands,
-            preload,
-            kernel,
-            firecracker_bin,
-            jailer_bin,
-            jailer_uid,
-            jailer_gid,
-            state_dir,
-            docker_bin,
-            rootfs_size_gib,
-            scratch_size_gib,
-            snapshots,
-            docker,
-            subnet,
-            uplink,
-            dns,
-            ..
-        } => Arc::new(FirecrackerBackend::new(FirecrackerSettings {
-            image: image.clone(),
-            image_commands: image_commands.clone(),
-            preload: preload.clone(),
-            firecracker_bin: firecracker_bin.clone(),
-            jailer: jailer_bin.as_ref().map(|bin| JailerSettings {
-                bin: bin.clone(),
-                uid: *jailer_uid,
-                gid: *jailer_gid,
-            }),
-            kernel: kernel.clone(),
-            state_dir: state_dir.into(),
-            docker_bin: docker_bin.clone(),
-            rootfs_size_gib: *rootfs_size_gib,
-            scratch_size_gib: *scratch_size_gib,
-            snapshots: *snapshots,
-            docker: *docker,
-            subnet: parse_fc_subnet(subnet).map_err(|e| anyhow::anyhow!(e))?,
-            uplink: uplink.clone(),
-            dns: dns.clone(),
-        })),
         BackendConfig::Daytona { api_url, api_key_env, api_key_file, image, snapshot, target, disk_gib, .. } => {
             let key = match std::env::var(api_key_env) {
                 Ok(k) if !k.trim().is_empty() => k.trim().to_string(),

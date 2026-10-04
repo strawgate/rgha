@@ -161,115 +161,16 @@ Enabled with `--metrics-addr` / `RGHA_METRICS_ADDR`. All metrics are labelled `c
 Useful alerts: `increase(rgha_runner_start_failures_total[10m]) > 0`;
 `histogram_quantile(0.9, rate(rgha_pickup_seconds_bucket[1h])) > 30`.
 
-## Firecracker backend (self-hosted microVMs)
+## Self-hosted capacity
 
-Each job runs in its own Firecracker microVM on a KVM host, built from the
-same runner image and `preload` as the Modal backend. The extra cost per job
-is $0 on hardware you already have.
-
-**Host requirements:**
-- Linux with `/dev/kvm`: bare metal, or a cloud VM with nested virtualization.
-- `firecracker` and, recommended, `jailer`, from
-  [Firecracker releases](https://github.com/firecracker-microvm/firecracker/releases).
-- An uncompressed guest kernel. The Firecracker CI kernels work, e.g.
-  `firecracker-ci/v1.15/x86_64/vmlinux-6.1.155`.
-- Docker, used once to build the rootfs from the runner image.
-- rgha running as **root**, for tap devices, iptables and the jailer.
-
-```toml
-[backends.fc]
-type = "firecracker"
-kernel = "/var/lib/rgha/vmlinux"
-firecracker_bin = "/usr/local/bin/firecracker"
-jailer_bin = "/usr/local/bin/jailer"   # chroot + unprivileged uid (jailer_uid/gid, default 10000)
-state_dir = "/var/lib/rgha/firecracker"
-# subnet = "10.213.0.0/16"             # one /30 per VM
-# uplink = "eth0"                      # default: the default route's interface
-[backends.fc.preload]
-actions = ["actions/checkout@v5"]
-node = ["22"]
-
-[[class]]
-name = "rgha-fc"
-backend = "fc"
-cpu = 2.0            # vCPUs = ceil(cpu_limit or cpu)
-memory_mib = 2048    # guest RAM = memory_limit_mib or memory_mib
-```
-
-**How it works:**
-- **Rootfs:** built from the image, `preload` and the guest init, converted to
-  ext4, cached under `state_dir` by content hash, and shared **read-only** by
-  all VMs. Each VM gets a sparse scratch disk; the guest init overlays it on
-  the rootfs and pivots into the overlay. Docker `ENV` is recorded into
-  `/etc/rgha/image.env` and re-applied in the guest. Stale rootfs images and
-  snapshots are removed at startup.
-- **Snapshot boot** (`snapshots = true`, the default): for each VM shape (vCPUs,
-  memory), rgha boots a template VM until it waits for its config, then takes
-  a memory snapshot. This takes about 6 s, once, and is cached on disk. Jobs
-  restore the snapshot: VMGenID reseeds the guest kernel RNG, and
-  `clock_realtime` corrects the clock. No per-job identity exists in the
-  snapshot. If a restore fails, the VM cold-boots.
-- **Registration token:** the single-use JIT config arrives on a read-only
-  raw drive (read with `O_DIRECT`, so restored clones never see stale data),
-  not the kernel command line.
-- **Shutdown:** the guest powers off when the runner exits. rgha then removes
-  the tap device and disk, and keeps the console log under `state_dir/logs`.
-- **Restarts:** VM state lives in `state_dir/vms`. A restarted controller
-  adopts VMs that are still running and cleans up those that have exited.
-
-**Docker in jobs** (`docker = true` on the backend): `dockerd` runs inside
-each microVM, with `/var/lib/docker` on the VM's ext4 scratch disk. It is
-started *before* the snapshot, so restored jobs find it already running.
-Verified: `docker build`/`run`, a `container:` job and a redis `services:`
-container all worked. VM start took 1.1–1.3 s and pickup 5.4–5.5 s, with
-`dockerd` already up. The CI guest kernel has legacy iptables only, without
-the `raw` table, so the guest uses `iptables-legacy` and sets
-`DOCKER_INSECURE_NO_IPTABLES_RAW=1`. That skips Docker's "direct access
-filtering", which protects published ports from other hosts on a shared LAN
-and doesn't apply inside a single-tenant microVM.
-
-**Several Firecracker backends on one host** (e.g. one with Docker and one
-without) need distinct `subnet`s (second octet) and `state_dir`s; rgha checks
-this. Interface and namespace names include the subnet, and the shared
-`RGHA-*` chains are never flushed, so one controller restarting doesn't
-disturb another backend's VMs or a running VM's egress rules.
-
-**Network isolation:** each VM runs in its own network namespace with an
-identical internal tap and guest address, which snapshot restore requires.
-That is NATed onto a unique veth /30 and then out of the uplink. Rules live in dedicated `RGHA-FWD` / `RGHA-NAT` chains;
-`RGHA-FWD` is inserted into `DOCKER-USER` when Docker is present. Guests
-cannot reach the host, RFC1918 ranges (your other VMs, Docker networks, LAN),
-CGNAT, or link-local/metadata addresses.
-
-**Egress allowlists** (`network = "github-only"` or `"allowlist"`) are
-enforced on the host. A locked-down VM's TCP 443 and 80 are redirected to a
-transparent proxy in rgha (ports 15443/15080). The proxy reads the TLS SNI or
-the HTTP `Host` header, checks it against the class allowlist (`*.x` matches
-subdomains), and connects upstream **by name**. Pairing an allowed name with
-another IP doesn't help, and names that resolve to private or link-local
-addresses are refused. Connections without an SNI (e.g. ECH) are dropped.
-Everything else from the VM is dropped except DNS to `dns` and any
-`allow_cidrs`. Verified on the testbed: GitHub worked, while `example.com`
-(HTTPS and HTTP), a spoofed resolve, a direct IP and `pypi.org` were blocked.
-DNS itself stays open to the configured resolver, which allows DNS-based
-exfiltration. To remove the
-rules:
-`iptables -D DOCKER-USER -j RGHA-FWD; iptables -D INPUT -i rgha+ -j DROP;
-iptables -D INPUT -i rgha+ -p tcp -m multiport --dports 15443,15080 -j ACCEPT;
-iptables -t nat -D POSTROUTING -j RGHA-NAT; iptables -t nat -D PREROUTING -j RGHA-PRE`.
-
-**Measured** (on a host loaded at 40–74 on 72 cores, so timings are pessimistic):
-
-| | Cold boot, rootfs copied per VM | Snapshot restore, shared rootfs |
-|---|---|---|
-| VM start (`boot_ms`: JIT config, namespace, disks, restore) | 2.3 s alone; 8.4 s for 3 concurrent | **1.1–1.4 s** for 4 concurrent |
-| Pickup (job assigned → runner took it) | 13.7–14.6 s | **5.3–5.7 s** |
-
-After a restore, the runner process start and its GitHub session take about
-3 s; that's the remaining floor.
-- Verified: shell, `setup-node`/npm, `setup-python`/PyPI and boot-profile jobs
-  ran in jailed microVMs (uid 10000, chroot); private ranges were blocked;
-  and a controller `kill -9` mid-job left no orphans.
+rgha targets serverless platforms (Modal, Daytona; Cloudflare Containers
+planned). To run runners on your own Kubernetes cluster or VMs, including
+sandboxed pods via gVisor or Kata (which can use Firecracker), use
+[actions-runner-controller](https://github.com/actions/actions-runner-controller).
+Both speak the same Runner Scale Set protocol and can serve the same repos with
+different labels. rgha's experimental Firecracker and Docker backends
+(snapshot fast boot, an egress allowlist proxy, Docker in jobs) are archived at
+tag `archive/firecracker-backend`.
 
 ## Class policies
 

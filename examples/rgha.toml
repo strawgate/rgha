@@ -33,10 +33,6 @@ type = "daytona"
 api_key_file = "~/.config/rgha/daytona"   # or DAYTONA_API_KEY; bare key or NAME=value
 # snapshot = "rgha-runner-vm"             # a linux-vm snapshot for VM isolation
 
-[backends.local]
-type = "docker"
-runtime = "runsc"  # gVisor; or a Kata runtime. Plain runc is refused for untrusted classes.
-
 # Tiny, cheap, locked down: safe for fork PRs on public repos.
 [[class]]
 name = "rgha-tiny"

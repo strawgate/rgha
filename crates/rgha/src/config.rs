@@ -70,20 +70,6 @@ pub enum BackendConfig {
         preload: crate::image::Preload,
         pricing: Option<Pricing>,
     },
-    /// Local containers via the docker CLI. Plain `runc` shares the host
-    /// kernel and is NOT a security boundary for untrusted code; set
-    /// `runtime = "runsc"` (gVisor) or a Kata runtime for isolation.
-    Docker {
-        #[serde(default = "default_runner_image")]
-        image: String,
-        runtime: Option<String>,
-        #[serde(default = "default_docker_bin")]
-        bin: String,
-        /// Must be set to run an untrusted class on plain runc.
-        #[serde(default)]
-        allow_insecure_runc: bool,
-        pricing: Option<Pricing>,
-    },
     /// Daytona sandboxes (REST API). `container` class unless `snapshot`
     /// names a VM-class (`linux-vm`) snapshot.
     Daytona {
@@ -104,74 +90,6 @@ pub enum BackendConfig {
         allow_container_class: bool,
         pricing: Option<Pricing>,
     },
-    /// One Firecracker microVM per job on this (KVM) host. Requires root.
-    Firecracker {
-        #[serde(default = "default_runner_image")]
-        image: String,
-        #[serde(default)]
-        image_commands: Vec<String>,
-        #[serde(default)]
-        preload: crate::image::Preload,
-        /// Guest kernel (uncompressed vmlinux), e.g. a Firecracker CI kernel.
-        kernel: String,
-        #[serde(default = "default_fc_bin")]
-        firecracker_bin: String,
-        /// Path to `jailer`; when set, VMs run chrooted as `jailer_uid`.
-        jailer_bin: Option<String>,
-        #[serde(default = "default_jailer_id")]
-        jailer_uid: u32,
-        #[serde(default = "default_jailer_id")]
-        jailer_gid: u32,
-        #[serde(default = "default_fc_state_dir")]
-        state_dir: String,
-        #[serde(default = "default_docker_bin")]
-        docker_bin: String,
-        #[serde(default = "default_rootfs_gib")]
-        rootfs_size_gib: u32,
-        /// Per-VM writable scratch disk (sparse; overlayed on the read-only rootfs).
-        #[serde(default = "default_scratch_gib")]
-        scratch_size_gib: u32,
-        /// Restore jobs from memory snapshots of a pre-booted template (fast boot).
-        #[serde(default = "default_true")]
-        snapshots: bool,
-        /// Run dockerd in each microVM so jobs can use Docker (`services:`,
-        /// `container:`, image builds). Started before snapshotting.
-        #[serde(default)]
-        docker: bool,
-        /// A /16 for VM networks (one /30 per VM).
-        #[serde(default = "default_fc_subnet")]
-        subnet: String,
-        /// Host interface for NAT; default: the default route's.
-        uplink: Option<String>,
-        #[serde(default = "default_dns")]
-        dns: String,
-        pricing: Option<Pricing>,
-    },
-}
-
-fn default_fc_bin() -> String {
-    "firecracker".into()
-}
-fn default_fc_state_dir() -> String {
-    "/var/lib/rgha/firecracker".into()
-}
-fn default_rootfs_gib() -> u32 {
-    8
-}
-fn default_scratch_gib() -> u32 {
-    16
-}
-fn default_true() -> bool {
-    true
-}
-fn default_fc_subnet() -> String {
-    "10.213.0.0/16".into()
-}
-fn default_dns() -> String {
-    "1.1.1.1".into()
-}
-fn default_jailer_id() -> u32 {
-    10000
 }
 
 fn default_daytona_url() -> String {
@@ -190,17 +108,12 @@ fn default_modal_app() -> String {
 fn default_runner_image() -> String {
     "ghcr.io/actions/actions-runner:latest".into()
 }
-fn default_docker_bin() -> String {
-    "docker".into()
-}
 
 impl BackendConfig {
     pub fn pricing(&self) -> Pricing {
         match self {
             BackendConfig::Modal { pricing, .. } => pricing.unwrap_or(Pricing::MODAL_SANDBOX),
-            BackendConfig::Docker { pricing, .. } => pricing.unwrap_or(Pricing::FREE),
             BackendConfig::Daytona { pricing, .. } => pricing.unwrap_or(Pricing::DAYTONA),
-            BackendConfig::Firecracker { pricing, .. } => pricing.unwrap_or(Pricing::FREE),
         }
     }
 }
@@ -405,37 +318,8 @@ impl Config {
                     c.backend
                 );
             }
-            if let BackendConfig::Docker { runtime, allow_insecure_runc, .. } = backend {
-                let isolated = runtime.as_deref().is_some_and(|r| r != "runc");
-                if c.policy.trust == crate::policy::Trust::Untrusted && !isolated && !allow_insecure_runc {
-                    bail!(
-                        "class {:?} is untrusted but backend {:?} uses plain runc (shared kernel). \
-                         Set runtime = \"runsc\" (gVisor) / a Kata runtime, or allow_insecure_runc = true for local testing",
-                        c.name,
-                        c.backend
-                    );
-                }
-                if c.network != NetworkMode::Open {
-                    bail!("class {:?}: network restrictions are not implemented for the docker backend yet", c.name);
-                }
-            }
         }
-        let mut fc_subnets = std::collections::HashSet::new();
-        let mut fc_dirs = std::collections::HashSet::new();
         for (name, b) in &self.backends {
-            if let BackendConfig::Firecracker { subnet, state_dir, .. } = b {
-                let octets =
-                    crate::backend::parse_fc_subnet(subnet).map_err(|e| anyhow::anyhow!("backend {name:?}: {e}"))?;
-                if !fc_subnets.insert(octets[1]) || !fc_dirs.insert(state_dir.clone()) {
-                    bail!(
-                        "firecracker backends need distinct `subnet` (second octet) and `state_dir`; {name:?} reuses one"
-                    );
-                }
-            }
-            if let BackendConfig::Firecracker { subnet, preload, .. } = b {
-                crate::backend::parse_fc_subnet(subnet).map_err(|e| anyhow::anyhow!("backend {name:?}: {e}"))?;
-                preload.validate().map_err(|e| anyhow::anyhow!("backend {name:?}: {e}"))?;
-            }
             if let BackendConfig::Modal { preload, .. } = b {
                 preload.validate().map_err(|e| anyhow::anyhow!("backend {name:?}: {e}"))?;
             }
@@ -463,24 +347,6 @@ mod tests {
         let cfg: Config = toml::from_str(EXAMPLE).unwrap();
         cfg.validate().unwrap();
         assert!(cfg.classes.len() >= 2);
-    }
-
-    #[test]
-    fn untrusted_on_runc_requires_opt_in() {
-        let toml = r#"
-            [github]
-            url = "https://github.com/o/r"
-            [backends.local]
-            type = "docker"
-            [[class]]
-            name = "x"
-            backend = "local"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        assert!(cfg.validate().unwrap_err().to_string().contains("runc"));
-        let cfg: Config =
-            toml::from_str(&toml.replace("type = \"docker\"", "type = \"docker\"\nruntime = \"runsc\"")).unwrap();
-        cfg.validate().unwrap();
     }
 
     #[test]

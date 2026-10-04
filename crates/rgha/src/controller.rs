@@ -1,5 +1,5 @@
-//! Per-class lifecycle: ensure the scale set exists, clean up orphans from a
-//! previous run, then listen (re-establishing the session on errors) until
+//! Per-class lifecycle: ensure the scale set exists, reconcile instances from
+//! a previous run, then listen (re-establishing the session on errors) until
 //! shutdown.
 
 use std::sync::Arc;
@@ -41,38 +41,13 @@ impl ClassController {
         Ok(ss)
     }
 
-    /// Stops instances left by a previous controller process, unless their
-    /// runner is mid-job (deregistration fails), in which case they finish.
-    async fn cleanup_orphans(&self) {
-        let instances = match self.backend.list(&self.class.name).await {
-            Ok(i) => i,
-            Err(e) => {
-                tracing::warn!(class = %self.class.name, error = %format!("{e:#}"), "could not list instances for orphan cleanup");
-                return;
-            }
-        };
-        for inst in instances {
-            let removable = match self.client.get_runner_by_name(&inst.runner_name).await {
-                Ok(None) => true,
-                Ok(Some(r)) => self.client.remove_runner(r.id).await.is_ok(),
-                Err(_) => false,
-            };
-            if removable {
-                tracing::info!(class = %self.class.name, runner = %inst.runner_name, "stopping orphaned instance");
-                let _ = self.backend.stop(&inst.id).await;
-            } else {
-                tracing::info!(class = %self.class.name, runner = %inst.runner_name, "orphan is busy; letting it finish");
-            }
-        }
-    }
-
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
         let ss = self.ensure_scale_set().await.with_context(|| format!("scale set for class {}", self.class.name))?;
         tracing::info!(class = %self.class.name, scale_set_id = ss.id, backend = self.backend.kind(), "class ready; runs-on: {}", self.class.name);
-        self.cleanup_orphans().await;
-
         let mut scaler =
             ClassScaler::new(self.class.clone(), ss.id, self.client.clone(), self.backend.clone(), self.pricing);
+        // Clean up instances left by a previous controller process.
+        scaler.reconcile().await;
         let mut backoff = Duration::from_secs(2);
         while !*shutdown.borrow() {
             let session = match self.client.message_session(ss.id, &self.owner).await {

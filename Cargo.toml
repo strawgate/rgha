@@ -36,6 +36,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 wiremock = "0.6"
 proptest = "1"
 toml = "0.9"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 clap = { version = "4", features = ["derive", "env"] }
 rgha-scaleset = { path = "crates/rgha-scaleset" }
 rgha-modal = { path = "crates/rgha-modal" }

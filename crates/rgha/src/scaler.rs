@@ -1,6 +1,6 @@
 //! Drives one runner class: enforces the class policy, starts one sandbox
 //! per needed runner, tears sandboxes down when jobs finish, reaps surplus
-//! idle runners, and keeps a per-second cost ledger.
+//! idle runners, reconciles leaked instances, and keeps a cost ledger.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,13 +13,42 @@ use tokio::sync::mpsc;
 
 use crate::backend::{Backend, Network, RunnerSpec};
 use crate::config::ClassConfig;
-use crate::cost::{Ledger, Pricing};
+use crate::cost::{Ledger, Pricing, github_hosted_cost};
+use crate::metrics;
 use crate::policy::Decision;
-use crate::pool::{Departed, Pool};
+use crate::pool::{Departed, Pool, State};
+
+/// How often to look for instances the pool doesn't know about.
+const RECONCILE_EVERY: Duration = Duration::from_secs(5 * 60);
+/// Attempts per runner within one poll before deferring to backoff.
+const START_ATTEMPTS: u32 = 3;
 
 #[derive(Debug)]
 enum Event {
     Exited { name: String, code: Option<i32>, timed_out: bool },
+}
+
+/// Exponential backoff after consecutive start failures, so a broken
+/// backend doesn't get hammered on every poll.
+#[derive(Debug, Default)]
+struct StartBackoff {
+    failures: u32,
+    until: Option<Instant>,
+}
+
+impl StartBackoff {
+    fn ready(&self, now: Instant) -> bool {
+        self.until.is_none_or(|u| now >= u)
+    }
+    fn failed(&mut self, now: Instant) -> Duration {
+        self.failures += 1;
+        let wait = Duration::from_secs(1u64 << self.failures.min(6)).min(Duration::from_secs(60));
+        self.until = Some(now + wait);
+        wait
+    }
+    fn succeeded(&mut self) {
+        *self = Self::default();
+    }
 }
 
 pub struct ClassScaler {
@@ -36,6 +65,8 @@ pub struct ClassScaler {
     /// asked GitHub to cancel, keyed by job id. Excluded from the desired count
     /// so no runner is started that could pick them up.
     blocked: HashMap<String, Instant>,
+    backoff: StartBackoff,
+    last_reconcile: Option<Instant>,
     pub ledger: Ledger,
 }
 
@@ -60,6 +91,8 @@ impl ClassScaler {
             events_tx,
             events_rx,
             blocked: HashMap::new(),
+            backoff: StartBackoff::default(),
+            last_reconcile: None,
             ledger: Ledger::default(),
         }
     }
@@ -71,6 +104,7 @@ impl ClassScaler {
     }
 
     fn log_reject(&self, job: &JobMessageBase, reason: &str, action: &str) {
+        metrics::policy_rejected(&self.class.name);
         tracing::warn!(
             class = %self.class.name,
             repo = %format!("{}/{}", job.owner_name, job.repository_name),
@@ -127,7 +161,9 @@ impl ClassScaler {
         let cpu = self.class.cpu_limit.unwrap_or(self.class.cpu);
         let usd = self.pricing.cost(cpu, self.class.memory_mib, sandbox_secs);
         let job_secs = job_secs.or(d.job.map(|j| j.as_secs_f64()));
+        let github_usd = job_secs.map(|j| github_hosted_cost(j, self.class.github_equivalent_per_min)).unwrap_or(0.0);
         self.ledger.record(sandbox_secs, job_secs, usd, self.class.github_equivalent_per_min);
+        metrics::job_finished(&self.class.name, why, job_secs, sandbox_secs, usd, github_usd);
         tracing::info!(
             class = %self.class.name,
             runner = %d.runner.name,
@@ -175,22 +211,36 @@ impl ClassScaler {
         if n == 0 {
             return;
         }
+        if !self.backoff.ready(Instant::now()) {
+            tracing::debug!(class = %self.class.name, wanted = n, "runner starts backing off");
+            return;
+        }
         tracing::info!(class = %self.class.name, count = n, pool = self.pool.len(), "starting runners");
         let starts = (0..n).map(|_| {
             let name = format!("{}-{}", self.class.name, &uuid::Uuid::new_v4().simple().to_string()[..10]);
-            start_one(self.client.clone(), self.backend.clone(), self.scale_set_id, &self.class, name)
+            start_with_retry(self.client.clone(), self.backend.clone(), self.scale_set_id, &self.class, name)
         });
+        let mut any_failed = false;
         for res in join_all(starts).await {
             match res {
                 Ok((spec, runner_id, instance_id, boot)) => {
+                    metrics::runner_started(&self.class.name, boot.as_secs_f64());
                     tracing::info!(class = %self.class.name, runner = %spec.name, %instance_id, boot_ms = boot.as_millis() as u64, "runner started");
                     self.pool.insert(spec.name.clone(), runner_id, instance_id.clone(), Instant::now());
                     self.watch(spec, instance_id);
                 }
                 Err(e) => {
-                    tracing::error!(class = %self.class.name, error = %format!("{e:#}"), "failed to start runner")
+                    any_failed = true;
+                    metrics::runner_start_failed(&self.class.name);
+                    tracing::error!(class = %self.class.name, error = %format!("{e:#}"), "failed to start runner");
                 }
             }
+        }
+        if any_failed {
+            let wait = self.backoff.failed(Instant::now());
+            tracing::warn!(class = %self.class.name, ?wait, "backing off runner starts");
+        } else {
+            self.backoff.succeeded();
         }
     }
 
@@ -221,7 +271,7 @@ impl ClassScaler {
     }
 
     async fn reap(&mut self) {
-        let ttl = std::time::Duration::from_secs(self.class.idle_ttl_secs);
+        let ttl = Duration::from_secs(self.class.idle_ttl_secs);
         for name in self.pool.reap_candidates(self.assigned(), ttl, Instant::now()) {
             let Some(r) = self.pool.get(&name).cloned() else { continue };
             // Deregister first: the service refuses if the runner just took a
@@ -241,10 +291,38 @@ impl ClassScaler {
         }
     }
 
+    /// Stops backend instances for this class that the pool doesn't track
+    /// (left by a crash or a previous process), unless their runner is
+    /// mid-job: deregistration fails for busy runners, and those finish.
+    pub async fn reconcile(&mut self) {
+        self.last_reconcile = Some(Instant::now());
+        let instances = match self.backend.list(&self.class.name).await {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!(class = %self.class.name, error = %format!("{e:#}"), "could not list instances to reconcile");
+                return;
+            }
+        };
+        for inst in instances.into_iter().filter(|i| self.pool.get(&i.runner_name).is_none()) {
+            let removable = match self.client.get_runner_by_name(&inst.runner_name).await {
+                Ok(None) => true,
+                Ok(Some(r)) => self.client.remove_runner(r.id).await.is_ok(),
+                Err(_) => false,
+            };
+            if removable {
+                tracing::info!(class = %self.class.name, runner = %inst.runner_name, instance = %inst.id, "stopping untracked instance");
+                metrics::orphan_stopped(&self.class.name);
+                let _ = self.backend.stop(&inst.id).await;
+            } else {
+                tracing::info!(class = %self.class.name, runner = %inst.runner_name, "untracked instance is busy; letting it finish");
+            }
+        }
+    }
+
     /// Deregisters and stops idle runners; leaves busy ones to finish (they
     /// are bounded by the sandbox timeout).
     pub async fn shutdown(&mut self) {
-        let idle: Vec<_> = self.pool.runners().filter(|r| r.state == crate::pool::State::Idle).cloned().collect();
+        let idle: Vec<_> = self.pool.runners().filter(|r| r.state == State::Idle).cloned().collect();
         let busy = self.pool.len() - idle.len();
         for r in idle {
             let _ = self.client.remove_runner(r.runner_id).await;
@@ -256,6 +334,11 @@ impl ClassScaler {
         if busy > 0 {
             tracing::warn!(class = %self.class.name, busy, "leaving busy runners to finish their jobs");
         }
+    }
+
+    fn publish_gauges(&self) {
+        let busy = self.pool.runners().filter(|r| r.state == State::Busy).count();
+        metrics::pool(&self.class.name, self.pool.len() - busy, busy, self.assigned());
     }
 }
 
@@ -272,6 +355,9 @@ impl rgha_scaleset::Scaler for ClassScaler {
             for s in &msg.job_started {
                 if self.pool.job_started(&s.runner_name, now) {
                     let pickup = secs_between(s.base.scale_set_assign_time, s.base.runner_assign_time);
+                    if let Some(p) = pickup {
+                        metrics::pickup(&self.class.name, p);
+                    }
                     tracing::info!(class = %self.class.name, runner = %s.runner_name, job = %s.base.job_display_name,
                         repo = %s.base.repository_name, event = %s.base.event_name,
                         pickup_secs = %fmt_secs(pickup), "job started");
@@ -281,7 +367,7 @@ impl rgha_scaleset::Scaler for ClassScaler {
                 self.blocked.remove(&c.base.job_id);
                 if let Some(d) = self.pool.remove(&c.runner_name, now) {
                     let job_secs = secs_between(c.base.runner_assign_time, c.base.finish_time);
-                    self.record(&d, &format!("job {}", c.result), job_secs);
+                    self.record(&d, &c.result, job_secs);
                     self.stop_in_background(d.runner.instance_id);
                 }
             }
@@ -293,6 +379,10 @@ impl rgha_scaleset::Scaler for ClassScaler {
         let deficit = self.pool.deficit(self.assigned());
         self.start_runners(deficit).await;
         self.reap().await;
+        if self.last_reconcile.is_none_or(|t| t.elapsed() >= RECONCILE_EVERY) {
+            self.reconcile().await;
+        }
+        self.publish_gauges();
         Ok(())
     }
 }
@@ -313,13 +403,39 @@ fn fmt_secs(s: Option<f64>) -> String {
     s.map(|s| format!("{s:.1}")).unwrap_or_else(|| "-".into())
 }
 
+/// Retries transient start failures (API blips, scheduling hiccups) a few
+/// times with short waits; each attempt uses a fresh runner registration.
+async fn start_with_retry(
+    client: Client,
+    backend: Arc<dyn Backend>,
+    scale_set_id: i64,
+    class: &ClassConfig,
+    name: String,
+) -> anyhow::Result<(RunnerSpec, i64, String, Duration)> {
+    let mut last = None;
+    for attempt in 0..START_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+        }
+        let name = if attempt == 0 { name.clone() } else { format!("{name}-{attempt}") };
+        match start_one(client.clone(), backend.clone(), scale_set_id, class, name).await {
+            Ok(ok) => return Ok(ok),
+            Err(e) => {
+                tracing::debug!(class = %class.name, attempt, error = %format!("{e:#}"), "runner start attempt failed");
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.expect("at least one attempt"))
+}
+
 async fn start_one(
     client: Client,
     backend: Arc<dyn Backend>,
     scale_set_id: i64,
     class: &ClassConfig,
     name: String,
-) -> anyhow::Result<(RunnerSpec, i64, String, std::time::Duration)> {
+) -> anyhow::Result<(RunnerSpec, i64, String, Duration)> {
     let t0 = Instant::now();
     let jit = client.generate_jit_config(scale_set_id, &name, "_work").await?;
     let spec = RunnerSpec {
@@ -356,5 +472,22 @@ mod tests {
         assert_eq!(secs_between(ts("2026-10-04T02:28:08.055Z"), ts("2026-10-04T02:28:13.452Z")), Some(5.397));
         assert_eq!(secs_between(ts("2026-10-04T02:28:13Z"), ts("2026-10-04T02:28:08Z")), None);
         assert_eq!(secs_between(None, ts("2026-10-04T02:28:08Z")), None);
+    }
+
+    #[test]
+    fn backoff_grows_and_resets() {
+        let t0 = Instant::now();
+        let mut b = StartBackoff::default();
+        assert!(b.ready(t0));
+        assert_eq!(b.failed(t0), Duration::from_secs(2));
+        assert!(!b.ready(t0 + Duration::from_secs(1)));
+        assert!(b.ready(t0 + Duration::from_secs(2)));
+        assert_eq!(b.failed(t0), Duration::from_secs(4));
+        for _ in 0..10 {
+            b.failed(t0);
+        }
+        assert_eq!(b.failed(t0), Duration::from_secs(60));
+        b.succeeded();
+        assert!(b.ready(t0));
     }
 }

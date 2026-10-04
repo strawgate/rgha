@@ -6,6 +6,7 @@ mod backend;
 mod config;
 mod controller;
 mod cost;
+mod metrics;
 mod policy;
 mod pool;
 mod scaler;
@@ -34,6 +35,12 @@ enum Cmd {
     Run {
         #[arg(short, long, env = "RGHA_CONFIG", default_value = "rgha.toml")]
         config: PathBuf,
+        /// Serve Prometheus metrics on this address, e.g. 0.0.0.0:9464.
+        #[arg(long, env = "RGHA_METRICS_ADDR")]
+        metrics_addr: Option<std::net::SocketAddr>,
+        /// Emit JSON logs (for log shippers).
+        #[arg(long, env = "RGHA_LOG_JSON")]
+        log_json: bool,
     },
     /// Validate config and connectivity (GitHub auth, runner group, backends).
     Check {
@@ -106,14 +113,16 @@ async fn build_backends(cfg: &Config) -> anyhow::Result<HashMap<String, Arc<dyn 
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("RGHA_LOG")
-                .unwrap_or_else(|_| "info,h2=warn,tonic=warn".into()),
-        )
-        .init();
+    let cli = Cli::parse();
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_env("RGHA_LOG").unwrap_or_else(|_| "info,h2=warn,tonic=warn".into());
+    if matches!(cli.command, Cmd::Run { log_json: true, .. }) {
+        tracing_subscriber::fmt().json().with_env_filter(filter).init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
-    match Cli::parse().command {
+    match cli.command {
         Cmd::Estimate { seconds, overhead, cpu, memory_mib, github_per_min } => {
             let sandbox = cost::Pricing::MODAL_SANDBOX.cost(cpu, memory_mib, seconds + overhead);
             let gh = cost::github_hosted_cost(seconds, github_per_min);
@@ -146,8 +155,11 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Run { config } => {
+        Cmd::Run { config, metrics_addr, .. } => {
             let cfg = Config::load(&config)?;
+            if let Some(addr) = metrics_addr {
+                metrics::install(addr)?;
+            }
             let client = github_client(&cfg)?;
             let group = client.get_runner_group_by_name(&cfg.github.runner_group).await?;
             let backends = build_backends(&cfg).await?;

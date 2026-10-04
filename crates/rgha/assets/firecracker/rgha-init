@@ -7,6 +7,15 @@
 # when the runner exits; Firecracker then exits, which tells rgha the
 # runner is done.
 
+# The kernel starts init with no PATH; Docker ENV is lost when the image is
+# exported to a rootfs, so it is recorded at build time in /etc/rgha/image.env.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+if [ -f /etc/rgha/image.env ]; then
+  while IFS= read -r line; do
+    [ -n "$line" ] && export "$line"
+  done < /etc/rgha/image.env
+fi
+
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev 2>/dev/null
@@ -35,7 +44,7 @@ fi
 
 if [ -n "$JIT" ] && [ "$JIT" != "probe" ]; then
   cd /home/runner
-  runuser -u runner -- env HOME=/home/runner ACTIONS_RUNNER_INPUT_JITCONFIG="$JIT" /home/runner/run.sh
+  runuser -u runner -- env HOME=/home/runner USER=runner ACTIONS_RUNNER_INPUT_JITCONFIG="$JIT" /home/runner/run.sh
   echo "rgha-init: runner exited $?"
 else
   echo "rgha-init: probe mode"

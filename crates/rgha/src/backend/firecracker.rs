@@ -145,6 +145,10 @@ pub(crate) fn dockerfile(s: &FirecrackerSettings) -> String {
     lines.push("USER root".into());
     lines.push("COPY rgha-init /sbin/rgha-init".into());
     lines.push("RUN chmod 0755 /sbin/rgha-init".into());
+    // Docker ENV doesn't survive `docker export`; record it for the guest init.
+    lines.push(
+        "RUN mkdir -p /etc/rgha && env | grep -Ev '^(HOSTNAME|HOME|PWD|SHLVL|_|OLDPWD)=' > /etc/rgha/image.env".into(),
+    );
     lines.join("\n") + "\n"
 }
 
@@ -633,6 +637,7 @@ mod tests {
         let (node, user, init) =
             (d.find("node").unwrap(), d.find("RUN echo hi").unwrap(), d.find("COPY rgha-init").unwrap());
         assert!(node < user && user < init);
+        assert!(d.contains("/etc/rgha/image.env"), "image ENV recorded for the guest");
         assert_ne!(content_hash("a"), content_hash("b"));
     }
 }

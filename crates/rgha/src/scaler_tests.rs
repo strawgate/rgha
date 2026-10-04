@@ -532,3 +532,26 @@ async fn failed_lookup_fails_closed() {
     assert_eq!(h.requests_to("/actions/runs/4242/cancel").await, 1);
     assert_eq!(h.requests_to("/actions/runs/4242").await, 3, "retried before failing closed");
 }
+
+#[tokio::test]
+async fn adaptive_warm_pool_grows_by_one_per_burst_not_by_burst_size() {
+    let h = Harness::new().await;
+    h.remove_runner(false).await;
+    let mut s = h.scaler(class("min_idle = 0\nwarm_max = 3\nwarm_grow_secs = 60\nwarm_shrink_secs = 300"));
+    s.scale(&h.session, Some(&ScaleSetMessage { message_id: -1, statistics: stats(0), ..Default::default() }))
+        .await
+        .unwrap();
+    assert!(h.backend.running().is_empty(), "floor 0: nothing warm at start");
+
+    // A burst of 3 jobs arrives with no runners: 3 cold starts, warm target +1 (not +3).
+    let burst = ScaleSetMessage { message_id: 1, statistics: stats(3), ..Default::default() };
+    s.scale(&h.session, Some(&burst)).await.unwrap();
+    assert_eq!(h.backend.running().len(), 4, "3 for the jobs + 1 warm");
+    assert_eq!(s.adaptive.as_ref().unwrap().target(), 1);
+
+    // Still within the grow interval: more cold demand doesn't add more warm runners.
+    let more = ScaleSetMessage { message_id: 2, statistics: stats(4), ..Default::default() };
+    s.scale(&h.session, Some(&more)).await.unwrap();
+    assert_eq!(s.adaptive.as_ref().unwrap().target(), 1);
+    assert_eq!(h.backend.running().len(), 5, "4 jobs + 1 warm (max_runners = 5)");
+}

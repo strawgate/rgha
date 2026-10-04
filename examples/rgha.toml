@@ -46,8 +46,8 @@ cpu_limit = 2.0          # burst cap: ~3x faster runner boot; billed by actual u
 memory_mib = 256         # billed floor while idle...
 memory_limit_mib = 2048  # ...jobs can use up to this (billed on usage)
 max_runners = 20
-min_idle = 1             # one warm runner: ~0.1s pickup, ~$0.024/h at these requests
-warm_for_secs = 900      # ...kept only for 15 min after the last job
+min_idle = 0             # floor: scale to zero when quiet
+warm_max = 4             # adaptive: +1 warm runner/min while jobs start cold, -1 per 5 min quiet
 max_job_minutes = 10
 network = "github-only"  # egress limited to GitHub runner endpoints
 [class.policy]
@@ -71,9 +71,10 @@ allowed_repos = ["strawgate/*"]
 [[class]]
 name = "rgha-docker"
 backend = "modal-vm"
-cpu = 1.0
+cpu = 0.125              # tiny idle request; jobs burst to the limits
 cpu_limit = 2.0
-memory_mib = 4096
+memory_mib = 512
+memory_limit_mib = 4096
 max_runners = 4
 max_job_minutes = 30
 network = "open"

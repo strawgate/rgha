@@ -33,8 +33,8 @@ what you use**, for both CPU and memory. So rgha requests a tiny floor and
 sets high limits:
 
 ```toml
-cpu = 0.125              # billed floor (Modal physical cores; 1 core = 2 vCPU)
-cpu_limit = 2.0          # jobs can burst to 2 cores; you pay for what they use
+cpu = 0.125              # billed floor, in Modal cores (1 busy thread ≈ 1 core)
+cpu_limit = 4.0          # jobs can burst to 4 CPUs; you pay for what they use
 memory_mib = 128
 memory_limit_mib = 4096
 ```

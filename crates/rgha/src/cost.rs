@@ -7,7 +7,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pricing {
-    /// USD per CPU unit per second, in the backend's CPU unit (Modal: physical core).
+    /// USD per CPU unit per second, in the backend's CPU unit (Modal: core, metered as CPU-seconds used).
     pub cpu_per_sec: f64,
     /// USD per GiB of memory per second.
     pub gib_per_sec: f64,

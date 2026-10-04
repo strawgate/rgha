@@ -108,6 +108,28 @@ estimate. Measured on the testbed (2026-10-04, `cpu = 0.125`, `memory_mib = 128`
 | Docker build job (VM runtime) | ~$0.00016 |
 | Idle warm runner | ~$0.021/hour (0.125 core + 128 MiB floor), ≈ 4 short jobs per minute |
 
+CPU-bound jobs (2026-10-04, `cpu/burn.py` in the testbed, fixed work,
+against public `ubuntu-latest` with 4 vCPUs). GitHub cost is at private-repo
+per-minute prices:
+
+| Job | GitHub-hosted | rgha, `cpu_limit = 2` | rgha, `cpu_limit = 4` |
+|---|---|---|---|
+| 1 thread, ~25 CPU-s | 25 s, $0.006 (1 min) | 29 s, $0.0013–0.0017 | 29 s, $0.0013 |
+| 4 processes, ~115 CPU-s | 47 s, $0.012 (4-core, 1 min) | 52–57 s, $0.0012–0.0046 | **29 s, $0.0046** |
+
+- One busy thread is metered as about one Modal core, and a Sandbox sees
+  `cpu_limit` CPUs. A fixed amount of work costs about the same at any limit,
+  so a **higher `cpu_limit` is faster at no extra cost**. The tradeoff is
+  how much an abusive job can burn before `max_job_secs`.
+- Per saturated CPU-second, a Modal Sandbox costs $0.0000394 against $0.00005
+  per vCPU-second on GitHub-hosted runners, only ~1.3× less. For short jobs,
+  most of rgha's advantage comes from GitHub's per-minute rounding and from
+  not paying for idle cores. For long CPU-bound jobs it converges to ~1.3×.
+- A single thread ran about 15% slower than on `ubuntu-latest`.
+- Throttled runs (`cpu_limit = 2` with 4 processes) metered inconsistently,
+  between 30 and 116 core-s for the same work. Unthrottled runs matched guest
+  CPU time.
+
 Levers, biggest first:
 
 - **Warm runners that never get a job dominate spend for light, bursty use.**

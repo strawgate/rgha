@@ -19,14 +19,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let items = client.billing_report(&app_id, now - hours * 3600, now).await?;
     let total: f64 = items.iter().map(|i| i.cost_usd).sum();
     println!("app {app}: {} billing rows over {hours}h, total ${total:.4}", items.len());
-    for i in items.iter().take(15) {
-        println!(
-            "  {} {:<40} ${:.6} {:?}",
-            i.object_id,
-            i.description.chars().take(40).collect::<String>(),
-            i.cost_usd,
-            i.cost_by_resource
-        );
+    for i in &items {
+        println!("  t={} ${:.6} {:?}", i.interval_unix, i.cost_usd, i.cost_by_resource);
     }
     Ok(())
 }

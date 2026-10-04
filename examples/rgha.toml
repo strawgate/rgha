@@ -37,7 +37,7 @@ api_key_file = "~/.config/rgha/daytona"   # or DAYTONA_API_KEY; bare key or NAME
 [[class]]
 name = "rgha-tiny"
 backend = "modal"
-cpu = 0.125              # Modal physical cores (1 core = 2 vCPU), the billed floor
+cpu = 0.125              # Modal cores, the billed floor (1 busy thread ≈ 1 core)
 cpu_limit = 2.0          # burst cap: ~3x faster runner boot; billed by actual usage
 memory_mib = 128         # billed floor while idle...
 memory_limit_mib = 2048  # ...jobs can use up to this (billed on usage)

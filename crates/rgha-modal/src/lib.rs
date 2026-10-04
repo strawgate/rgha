@@ -76,7 +76,8 @@ pub struct SandboxSpec {
     pub workdir: Option<String>,
     /// Injected through an ephemeral Modal Secret, never in the definition itself.
     pub secret_env: HashMap<String, String>,
-    /// Physical cores (Modal bills per physical core; 1 core = 2 vCPU).
+    /// Cores. Measured on gVisor: `cpu_limit = N` shows N CPUs to the
+    /// guest, and each fully busy thread is metered as one core.
     pub cpu: f64,
     pub cpu_limit: Option<f64>,
     pub memory_mib: u32,
@@ -122,6 +123,8 @@ pub struct ResourceUsage {
 #[derive(Debug, Clone)]
 pub struct BillingItem {
     pub object_id: String,
+    /// Start of the billing interval (Unix seconds).
+    pub interval_unix: i64,
     pub description: String,
     pub cost_usd: f64,
     pub cost_by_resource: HashMap<String, f64>,
@@ -462,6 +465,7 @@ impl Client {
         while let Some(item) = stream.message().await? {
             out.push(BillingItem {
                 object_id: item.object_id,
+                interval_unix: item.interval.map(|t| t.seconds).unwrap_or(0),
                 description: item.description,
                 cost_usd: item.cost.parse().unwrap_or(0.0),
                 cost_by_resource: item

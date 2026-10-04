@@ -134,7 +134,7 @@ pub struct ClassConfig {
     /// Scale set name; workflows use `runs-on: <name>`.
     pub name: String,
     pub backend: String,
-    /// CPU in the backend's unit (Modal: physical cores; Docker: CPUs).
+    /// CPU in the backend's unit (Modal: cores; a Sandbox sees `cpu_limit` CPUs; Docker: CPUs).
     #[serde(default = "default_cpu")]
     pub cpu: f64,
     /// Hard CPU cap; may exceed `cpu` to let boot and bursty steps go faster.

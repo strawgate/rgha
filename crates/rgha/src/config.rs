@@ -134,6 +134,10 @@ pub enum BackendConfig {
         /// Restore jobs from memory snapshots of a pre-booted template (fast boot).
         #[serde(default = "default_true")]
         snapshots: bool,
+        /// Run dockerd in each microVM so jobs can use Docker (`services:`,
+        /// `container:`, image builds). Started before snapshotting.
+        #[serde(default)]
+        docker: bool,
         /// A /16 for VM networks (one /30 per VM).
         #[serde(default = "default_fc_subnet")]
         subnet: String,
@@ -416,7 +420,18 @@ impl Config {
                 }
             }
         }
+        let mut fc_subnets = std::collections::HashSet::new();
+        let mut fc_dirs = std::collections::HashSet::new();
         for (name, b) in &self.backends {
+            if let BackendConfig::Firecracker { subnet, state_dir, .. } = b {
+                let octets =
+                    crate::backend::parse_fc_subnet(subnet).map_err(|e| anyhow::anyhow!("backend {name:?}: {e}"))?;
+                if !fc_subnets.insert(octets[1]) || !fc_dirs.insert(state_dir.clone()) {
+                    bail!(
+                        "firecracker backends need distinct `subnet` (second octet) and `state_dir`; {name:?} reuses one"
+                    );
+                }
+            }
             if let BackendConfig::Firecracker { subnet, preload, .. } = b {
                 crate::backend::parse_fc_subnet(subnet).map_err(|e| anyhow::anyhow!("backend {name:?}: {e}"))?;
                 preload.validate().map_err(|e| anyhow::anyhow!("backend {name:?}: {e}"))?;

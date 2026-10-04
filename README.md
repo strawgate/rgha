@@ -143,7 +143,7 @@ backend, policy enforcement on real PRs, the pool scaler, Prometheus metrics,
 and the cost ledger. The local docker backend and GitHub App auth are
 unit-tested only. Planned:
 
-- [x] Firecracker backend for KVM hosts (egress allowlists, Docker-in-job and fast boot in progress: #22–#24)
+- [x] Firecracker backend for KVM hosts: snapshot fast boot, egress allowlists, Docker in jobs
 - [ ] Cloudflare Containers backend (Firecracker microVM per job, CPU billed on usage)
 - [ ] Network allowlists for the local backend
 - [ ] Fork detection via the REST API (head repo ≠ base repo) for finer policies

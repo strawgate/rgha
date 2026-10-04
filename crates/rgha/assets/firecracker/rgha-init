@@ -59,6 +59,12 @@ ip link set lo up 2>/dev/null
 dns=$(sed -n 's/.*rgha.dns=\([^ ]*\).*/\1/p' /proc/cmdline)
 echo "nameserver ${dns:-1.1.1.1}" > /etc/resolv.conf
 
+# Optional hook run as root *before* waiting for the config, so whatever it
+# starts (e.g. dockerd) is already running in snapshot templates.
+if [ -x /etc/rgha/pre-config ]; then
+  /etc/rgha/pre-config
+fi
+
 # Config drive: "rgha1 <epoch seconds>\n<jit config>\n", NUL padded.
 read_config() { dd if=/dev/vdb iflag=direct bs=4096 count=16 2>/dev/null | tr -d '\000'; }
 CONFIG=$(read_config)

@@ -217,6 +217,23 @@ memory_mib = 2048    # guest RAM = memory_limit_mib or memory_mib
 - **Restarts:** VM state lives in `state_dir/vms`. A restarted controller
   adopts VMs that are still running and cleans up those that have exited.
 
+**Docker in jobs** (`docker = true` on the backend): `dockerd` runs inside
+each microVM, with `/var/lib/docker` on the VM's ext4 scratch disk. It is
+started *before* the snapshot, so restored jobs find it already running.
+Verified: `docker build`/`run`, a `container:` job and a redis `services:`
+container all worked. VM start took 1.1–1.3 s and pickup 5.4–5.5 s, with
+`dockerd` already up. The CI guest kernel has legacy iptables only, without
+the `raw` table, so the guest uses `iptables-legacy` and sets
+`DOCKER_INSECURE_NO_IPTABLES_RAW=1`. That skips Docker's "direct access
+filtering", which protects published ports from other hosts on a shared LAN
+and doesn't apply inside a single-tenant microVM.
+
+**Several Firecracker backends on one host** (e.g. one with Docker and one
+without) need distinct `subnet`s (second octet) and `state_dir`s; rgha checks
+this. Interface and namespace names include the subnet, and the shared
+`RGHA-*` chains are never flushed, so one controller restarting doesn't
+disturb another backend's VMs or a running VM's egress rules.
+
 **Network isolation:** each VM runs in its own network namespace with an
 identical internal tap and guest address, which snapshot restore requires.
 That is NATed onto a unique veth /30 and then out of the uplink. Rules live in dedicated `RGHA-FWD` / `RGHA-NAT` chains;

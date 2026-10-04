@@ -176,6 +176,17 @@ pub struct WorkflowRun {
     pub repository: Option<RepoRef>,
     #[serde(default)]
     pub head_repository: Option<RepoRef>,
+    /// Who started the run (for a PR: its author).
+    #[serde(default)]
+    pub actor: Option<UserRef>,
+    /// Who triggered this attempt (differs from `actor` on re-runs).
+    #[serde(default)]
+    pub triggering_actor: Option<UserRef>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct UserRef {
+    pub login: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]

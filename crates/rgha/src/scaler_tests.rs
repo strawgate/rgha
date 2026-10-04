@@ -555,3 +555,68 @@ async fn adaptive_warm_pool_grows_by_one_per_burst_not_by_burst_size() {
     assert_eq!(s.adaptive.as_ref().unwrap().target(), 1);
     assert_eq!(h.backend.running().len(), 5, "4 jobs + 1 warm (max_runners = 5)");
 }
+
+async fn mock_run_by(h: &Harness, actor: &str, triggering: &str) {
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/actions/runs/4242"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 4242, "event": "push",
+            "repository": {"full_name": "o/r"}, "head_repository": {"full_name": "o/r"},
+            "actor": {"login": actor}, "triggering_actor": {"login": triggering}
+        })))
+        .mount(&h.server)
+        .await;
+}
+
+fn push_assigned(id: i64, job: &str) -> ScaleSetMessage {
+    ScaleSetMessage {
+        message_id: id,
+        statistics: stats(1),
+        job_assigned: vec![JobAssigned { base: base(job, "push", MAIN) }],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn actor_allowlist_cancels_outsiders() {
+    let h = Harness::new().await;
+    mock_run_by(&h, "someone-else", "someone-else").await;
+    let mut s = h.scaler(class("[policy]\nallowed_actors = [\"strawgate\"]"));
+    s.scale(&h.session, Some(&push_assigned(1, "j1"))).await.unwrap();
+    settle().await;
+    assert!(h.backend.running().is_empty(), "outsider's job gets no runner");
+    assert_eq!(h.requests_to("/actions/runs/4242/cancel").await, 1);
+}
+
+#[tokio::test]
+async fn actor_allowlist_accepts_us() {
+    let h = Harness::new().await;
+    mock_run_by(&h, "strawgate", "strawgate").await;
+    let mut s = h.scaler(class("[policy]\nallowed_actors = [\"strawgate\"]"));
+    s.scale(&h.session, Some(&push_assigned(1, "j1"))).await.unwrap();
+    settle().await;
+    assert_eq!(h.backend.running().len(), 1);
+    assert_eq!(h.requests_to("/cancel").await, 0);
+}
+
+#[tokio::test]
+async fn actor_allowlist_rejects_rerun_of_outsiders_run() {
+    let h = Harness::new().await;
+    mock_run_by(&h, "someone-else", "strawgate").await;
+    let mut s = h.scaler(class("[policy]\nallowed_actors = [\"strawgate\"]"));
+    s.scale(&h.session, Some(&push_assigned(1, "j1"))).await.unwrap();
+    settle().await;
+    assert!(h.backend.running().is_empty(), "a maintainer re-run doesn't launder an outsider's run");
+    assert_eq!(h.requests_to("/actions/runs/4242/cancel").await, 1);
+}
+
+#[tokio::test]
+async fn actor_lookup_failure_fails_closed() {
+    let h = Harness::new().await;
+    mock_run(&h, 500, "o/r").await;
+    let mut s = h.scaler(class("[policy]\nallowed_actors = [\"strawgate\"]"));
+    s.scale(&h.session, Some(&push_assigned(1, "j1"))).await.unwrap();
+    settle().await;
+    assert!(h.backend.running().is_empty());
+    assert_eq!(h.requests_to("/actions/runs/4242/cancel").await, 1);
+}

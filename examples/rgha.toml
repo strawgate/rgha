@@ -48,6 +48,7 @@ max_job_minutes = 10
 network = "github-only"  # egress limited to GitHub runner endpoints
 [class.policy]
 trust = "untrusted"
+# allowed_actors = ["your-login"]   # keep the class private to specific people
 
 # Bigger, open egress, only for code already on a branch/tag.
 [[class]]

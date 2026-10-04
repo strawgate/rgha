@@ -187,11 +187,21 @@ allowed_repos = ["my-org/*"]
 allowed_workflow_refs = ["my-org/*/.github/workflows/*@refs/heads/main"]
 allow_fork_prs = false         # default: true (untrusted), false (trusted)
 allow_same_repo_prs = true     # trusted only: also take PRs from branches of the same repo
+allowed_actors = ["alice", "bob"]  # only runs started *and* triggered by these logins
+denied_actors = ["mallory"]
 ```
 
-The scale set message doesn't say whether a PR comes from a fork. When the
-decision depends on it, rgha looks the run up through the REST API (cached
-per run) and compares the head and base repositories. If the lookup fails
+`allowed_actors` restricts a class to specific people. Both the run's `actor`
+(e.g. the PR author) and its `triggering_actor` (e.g. whoever re-ran it) must
+be listed, so a maintainer re-running an outsider's PR doesn't put it on these
+runners. Use it to keep a deployment private to a team, even on a public repo.
+Verified live: with `allowed_actors = ["octocat"]`, our own run was cancelled
+before any runner started; with our login listed, everything ran.
+
+The scale set message doesn't say whether a PR comes from a fork or who
+triggered it. When the decision depends on either, rgha looks the run up
+through the REST API (cached per run). It compares the head and base
+repositories, and reads `actor` and `triggering_actor`. If the lookup fails
 after retries, the job is rejected (fail closed). Verified on the testbed: a
 real fork PR was cancelled in 4 s on a class with `allow_fork_prs = false`,
 while the same-repo PR ran.

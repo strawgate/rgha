@@ -79,6 +79,7 @@ GitHub ──long-poll──► rgha (one listener per class)
                         ├─ pool: one runner per assigned job (+ optional warm buffer)
                         └─ backend ─┬─ Modal Sandbox (gVisor, or VM runtime)
                                     ├─ Daytona sandbox (container, or linux-vm snapshot)
+                                    ├─ Firecracker microVM on your KVM host (jailer)
                                     └─ docker --runtime runsc|kata (local)
 sandbox: official actions/runner + single-use JIT config → 1 job → destroyed
 ```
@@ -142,7 +143,7 @@ backend, policy enforcement on real PRs, the pool scaler, Prometheus metrics,
 and the cost ledger. The local docker backend and GitHub App auth are
 unit-tested only. Planned:
 
-- [ ] Firecracker / Cloud Hypervisor backend for bare-metal Linux hosts
+- [x] Firecracker backend for KVM hosts (egress allowlists, Docker-in-job and fast boot in progress: #22–#24)
 - [ ] Cloudflare Containers backend (Firecracker microVM per job, CPU billed on usage)
 - [ ] Network allowlists for the local backend
 - [ ] Fork detection via the REST API (head repo ≠ base repo) for finer policies

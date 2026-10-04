@@ -134,6 +134,10 @@ pub enum BackendConfig {
         /// Restore jobs from memory snapshots of a pre-booted template (fast boot).
         #[serde(default = "default_true")]
         snapshots: bool,
+        /// Run dockerd in each microVM so jobs can use Docker (`services:`,
+        /// `container:`, image builds). Started before snapshotting.
+        #[serde(default)]
+        docker: bool,
         /// A /16 for VM networks (one /30 per VM).
         #[serde(default = "default_fc_subnet")]
         subnet: String,

@@ -50,6 +50,20 @@ const TAP_HOST_IP: &str = "172.30.0.1";
 const GUEST_IP: &str = "172.30.0.2";
 const GUEST_MAC: &str = "06:00:ac:1e:00:02";
 
+/// Docker-in-job: the runner image ships static dockerd/containerd/runc; the
+/// guest kernel has legacy iptables (no nf_tables), so switch alternatives.
+/// dockerd is started by the pre-config hook, i.e. before the snapshot.
+const DOCKER_LAYERS: &[&str] = &[
+    "RUN apt-get update && apt-get install -y --no-install-recommends iptables && rm -rf /var/lib/apt/lists/* \\
+     && update-alternatives --set iptables /usr/sbin/iptables-legacy \\
+     && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy",
+    "RUN mkdir -p /etc/rgha && printf '%s\\n' '#!/bin/bash' \\
+     'dockerd --iptables=true > /var/log/dockerd.log 2>&1 &' \\
+     'for i in $(seq 1 150); do docker info > /dev/null 2>&1 && break; sleep 0.1; done' \\
+     'if docker info > /dev/null 2>&1; then echo \"rgha-init: dockerd ready\"; else echo \"rgha-init: dockerd failed\"; tail -20 /var/log/dockerd.log; fi' \\
+     > /etc/rgha/pre-config && chmod 0755 /etc/rgha/pre-config",
+];
+
 #[derive(Debug, Clone)]
 pub struct JailerSettings {
     pub bin: String,
@@ -71,6 +85,8 @@ pub struct FirecrackerSettings {
     pub scratch_size_gib: u32,
     /// Restore jobs from memory snapshots (fast boot). Off = cold boot.
     pub snapshots: bool,
+    /// Run dockerd in the guest (started before snapshotting).
+    pub docker: bool,
     /// First two octets of the veth /16, e.g. `[10, 213]`.
     pub subnet: [u8; 2],
     pub uplink: Option<String>,
@@ -191,6 +207,9 @@ pub(crate) fn dockerfile(s: &FirecrackerSettings) -> String {
     lines.extend(s.preload.dockerfile_commands());
     lines.extend(s.image_commands.iter().cloned());
     lines.push("USER root".into());
+    if s.docker {
+        lines.extend(DOCKER_LAYERS.iter().map(|l| l.to_string()));
+    }
     lines.push("COPY rgha-init /sbin/rgha-init".into());
     lines.push("RUN chmod 0755 /sbin/rgha-init && mkdir -p /mnt/scratch /mnt/newroot".into());
     // Docker ENV doesn't survive `docker export`; record it for the guest init.
@@ -1053,6 +1072,7 @@ mod tests {
             rootfs_size_gib: 8,
             scratch_size_gib: 16,
             snapshots: true,
+            docker: false,
             subnet: [10, 213],
             uplink: None,
             dns: "1.1.1.1".into(),
@@ -1064,6 +1084,10 @@ mod tests {
         assert!(node < user && user < init);
         assert!(d.contains("/etc/rgha/image.env"), "image ENV recorded for the guest");
         assert!(d.contains("/mnt/scratch /mnt/newroot"), "overlay mount points exist in the read-only rootfs");
+        assert!(!d.contains("dockerd"));
+        let with_docker = dockerfile(&FirecrackerSettings { docker: true, ..s.clone() });
+        assert!(with_docker.contains("iptables-legacy") && with_docker.contains("/etc/rgha/pre-config"));
+        assert!(with_docker.find("pre-config").unwrap() < with_docker.find("COPY rgha-init").unwrap());
         assert_ne!(content_hash("a"), content_hash("b"));
     }
 }

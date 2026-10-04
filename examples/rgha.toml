@@ -1,0 +1,49 @@
+# rgha example configuration.
+# Workflows pick a class with `runs-on: <class name>`.
+
+[github]
+url = "https://github.com/strawgate/rgha"   # org, repo, or enterprise URL
+runner_group = "default"                    # must allow public repos if used by public repos
+# Preferred: a GitHub App (Administration: write for repos, or Self-hosted runners: write for orgs).
+# app_client_id = "Iv23li..."
+# app_installation_id = 12345678
+# app_private_key_path = "/etc/rgha/app.pem"  # or RGHA_GITHUB_APP_PRIVATE_KEY
+token_env = "GITHUB_TOKEN"                  # PAT fallback when no App is configured
+
+[backends.modal]
+type = "modal"
+app = "rgha"
+image = "ghcr.io/actions/actions-runner:latest"
+# runtime = "vm"   # Modal's alpha VM runtime: real kernel, Docker-in-job
+
+[backends.local]
+type = "docker"
+runtime = "runsc"  # gVisor; or a Kata runtime. Plain runc is refused for untrusted classes.
+
+# Tiny, cheap, locked down: safe for fork PRs on public repos.
+[[class]]
+name = "rgha-tiny"
+backend = "modal"
+cpu = 0.125              # Modal physical cores (1 core = 2 vCPU), the billed floor
+cpu_limit = 2.0          # burst cap: ~3x faster runner boot; billed by actual usage
+memory_mib = 512
+max_runners = 20
+min_idle = 0             # scale to zero: pay only while jobs run (set 1+ for ~instant pickup)
+max_job_minutes = 10
+network = "github-only"  # egress limited to GitHub runner endpoints
+[class.policy]
+trust = "untrusted"
+
+# Bigger, open egress, only for code already on a branch/tag.
+[[class]]
+name = "rgha-2core"
+backend = "modal"
+cpu = 1.0
+memory_mib = 4096
+max_runners = 10
+min_idle = 0             # warm runners on trusted classes need allow_warm_trusted (see README)
+max_job_minutes = 30
+network = "open"
+[class.policy]
+trust = "trusted"
+allowed_repos = ["strawgate/*"]

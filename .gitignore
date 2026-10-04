@@ -1,4 +1,4 @@
 /target
 *.pem
 .env
-rgha.toml
+/rgha.toml

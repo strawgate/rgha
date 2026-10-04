@@ -35,7 +35,7 @@ impl DockerBackend {
             "--label".into(),
             format!("{LABEL_RUNNER}={}", spec.name),
             "--cpus".into(),
-            format!("{}", spec.cpu),
+            format!("{}", spec.cpu_limit),
             "--memory".into(),
             format!("{}m", spec.memory_mib),
             // Keep Docker's default capability set: many workflows rely on
@@ -141,6 +141,7 @@ mod tests {
             class: "c".into(),
             jit_config: "TOPSECRET".into(),
             cpu: 0.5,
+            cpu_limit: 0.5,
             memory_mib: 768,
             timeout: Duration::from_secs(60),
             network: Network::Open,

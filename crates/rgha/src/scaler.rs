@@ -1,13 +1,14 @@
-//! Drives one runner class: acquires jobs allowed by policy, starts one
-//! sandbox per needed runner, tears sandboxes down when jobs finish, reaps
-//! surplus idle runners, and keeps a per-second cost ledger.
+//! Drives one runner class: enforces the class policy, starts one sandbox
+//! per needed runner, tears sandboxes down when jobs finish, reaps surplus
+//! idle runners, and keeps a per-second cost ledger.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Datelike, Utc};
 use futures::future::join_all;
-use rgha_scaleset::{Client, MessageSession, ScaleSetMessage, Statistics};
+use rgha_scaleset::{Client, JobMessageBase, MessageSession, ScaleSetMessage, Statistics};
 use tokio::sync::mpsc;
 
 use crate::backend::{Backend, Network, RunnerSpec};
@@ -31,7 +32,10 @@ pub struct ClassScaler {
     last_stats: Option<Statistics>,
     events_tx: mpsc::UnboundedSender<Event>,
     events_rx: mpsc::UnboundedReceiver<Event>,
-    rejected: HashSet<i64>,
+    /// Jobs assigned to this scale set that policy rejected and that we have
+    /// asked GitHub to cancel, keyed by job id. Excluded from the desired count
+    /// so no runner is started that could pick them up.
+    blocked: HashMap<String, Instant>,
     pub ledger: Ledger,
 }
 
@@ -55,35 +59,36 @@ impl ClassScaler {
             last_stats: None,
             events_tx,
             events_rx,
-            rejected: HashSet::new(),
+            blocked: HashMap::new(),
             ledger: Ledger::default(),
         }
     }
 
+    /// Assigned jobs we intend to run (assigned minus policy-blocked).
     fn assigned(&self) -> i64 {
-        self.last_stats.map(|s| s.total_assigned_jobs).unwrap_or(0)
+        let assigned = self.last_stats.map(|s| s.total_assigned_jobs).unwrap_or(0);
+        (assigned - self.blocked.len() as i64).max(0)
     }
 
+    fn log_reject(&self, job: &JobMessageBase, reason: &str, action: &str) {
+        tracing::warn!(
+            class = %self.class.name,
+            repo = %format!("{}/{}", job.owner_name, job.repository_name),
+            workflow_ref = %job.job_workflow_ref,
+            event = %job.event_name,
+            run_id = job.workflow_run_id,
+            %reason,
+            "policy rejected job: {action}"
+        );
+    }
+
+    /// Legacy flow: jobs offered as `JobAvailable` are only acquired if allowed.
     async fn acquire(&mut self, session: &MessageSession, msg: &ScaleSetMessage) -> rgha_scaleset::Result<()> {
         let mut ids = Vec::new();
         for job in &msg.job_available {
             match self.class.policy.evaluate(&job.base) {
                 Decision::Acquire => ids.push(job.base.runner_request_id),
-                Decision::Reject(reason) => {
-                    if self.rejected.len() > 10_000 {
-                        self.rejected.clear();
-                    }
-                    if self.rejected.insert(job.base.runner_request_id) {
-                        tracing::warn!(
-                            class = %self.class.name,
-                            repo = %format!("{}/{}", job.base.owner_name, job.base.repository_name),
-                            workflow_ref = %job.base.job_workflow_ref,
-                            event = %job.base.event_name,
-                            %reason,
-                            "not acquiring job (it stays queued)"
-                        );
-                    }
-                }
+                Decision::Reject(reason) => self.log_reject(&job.base, &reason, "not acquiring"),
             }
         }
         if !ids.is_empty() {
@@ -93,16 +98,41 @@ impl ClassScaler {
         Ok(())
     }
 
-    fn record(&mut self, d: &Departed, why: &str) {
+    /// Current flow: the service assigns jobs to the scale set directly
+    /// (`JobAssigned`, no acquire step), so a disallowed job can only be
+    /// stopped by cancelling its workflow run.
+    fn enforce_assigned(&mut self, msg: &ScaleSetMessage) {
+        let now = Instant::now();
+        self.blocked.retain(|_, at| now.saturating_duration_since(*at) < Duration::from_secs(15 * 60));
+        for job in &msg.job_assigned {
+            let Decision::Reject(reason) = self.class.policy.evaluate(&job.base) else { continue };
+            if self.blocked.insert(job.base.job_id.clone(), now).is_some() {
+                continue; // redelivered; already cancelling
+            }
+            self.log_reject(&job.base, &reason, "cancelling workflow run");
+            let (client, b) = (self.client.clone(), job.base.clone());
+            tokio::spawn(async move {
+                if let Err(e) = client.cancel_workflow_run(&b.owner_name, &b.repository_name, b.workflow_run_id).await {
+                    tracing::error!(run_id = b.workflow_run_id, error = %e, "failed to cancel rejected workflow run");
+                }
+            });
+        }
+    }
+
+    /// `job_secs` from GitHub's timestamps wins over our own observation,
+    /// which is coarse because start/complete often arrive in one batch.
+    fn record(&mut self, d: &Departed, why: &str, job_secs: Option<f64>) {
         let sandbox_secs = d.lifetime.as_secs_f64();
-        let usd = self.pricing.cost(self.class.cpu, self.class.memory_mib, sandbox_secs);
-        let job_secs = d.job.map(|j| j.as_secs_f64());
+        // Priced at the CPU limit: an upper bound when bursting above the request.
+        let cpu = self.class.cpu_limit.unwrap_or(self.class.cpu);
+        let usd = self.pricing.cost(cpu, self.class.memory_mib, sandbox_secs);
+        let job_secs = job_secs.or(d.job.map(|j| j.as_secs_f64()));
         self.ledger.record(sandbox_secs, job_secs, usd, self.class.github_equivalent_per_min);
         tracing::info!(
             class = %self.class.name,
             runner = %d.runner.name,
             why,
-            job_secs = job_secs.map(|s| format!("{s:.1}")).unwrap_or_else(|| "-".into()),
+            job_secs = %fmt_secs(job_secs),
             sandbox_secs = format!("{sandbox_secs:.1}"),
             cost_usd = format!("{usd:.6}"),
             total_jobs = self.ledger.jobs,
@@ -126,7 +156,7 @@ impl ClassScaler {
             if let Some(d) = self.pool.remove(&name, Instant::now()) {
                 let why = if timed_out { "timed out" } else { "instance exited" };
                 tracing::info!(class = %self.class.name, runner = %name, ?code, why, "runner instance ended");
-                self.record(&d, why);
+                self.record(&d, why, None);
                 // A runner that died before taking a job is still registered.
                 let client = self.client.clone();
                 let id = d.runner.runner_id;
@@ -200,7 +230,7 @@ impl ClassScaler {
                 }
             }
             if let Some(d) = self.pool.remove(&name, Instant::now()) {
-                self.record(&d, "reaped idle");
+                self.record(&d, "reaped idle", None);
                 self.stop_in_background(d.runner.instance_id);
             }
         }
@@ -215,7 +245,7 @@ impl ClassScaler {
             let _ = self.client.remove_runner(r.runner_id).await;
             let _ = self.backend.stop(&r.instance_id).await;
             if let Some(d) = self.pool.remove(&r.name, Instant::now()) {
-                self.record(&d, "shutdown");
+                self.record(&d, "shutdown", None);
             }
         }
         if busy > 0 {
@@ -229,22 +259,24 @@ impl rgha_scaleset::Scaler for ClassScaler {
     async fn scale(&mut self, session: &MessageSession, msg: Option<&ScaleSetMessage>) -> rgha_scaleset::Result<()> {
         self.drain_events();
         if let Some(msg) = msg {
+            tracing::debug!(class = %self.class.name, ?msg, "message");
             // Acquire first so jobs are assigned as early as possible.
             self.acquire(session, msg).await?;
+            self.enforce_assigned(msg);
             let now = Instant::now();
             for s in &msg.job_started {
                 if self.pool.job_started(&s.runner_name, now) {
-                    let wait = match (s.base.queue_time, s.base.runner_assign_time) {
-                        (Some(q), Some(a)) if a > q => format!("{:.1}", (a - q).num_milliseconds() as f64 / 1000.0),
-                        _ => "-".into(),
-                    };
+                    let pickup = secs_between(s.base.scale_set_assign_time, s.base.runner_assign_time);
                     tracing::info!(class = %self.class.name, runner = %s.runner_name, job = %s.base.job_display_name,
-                        repo = %s.base.repository_name, queue_secs = %wait, "job started");
+                        repo = %s.base.repository_name, event = %s.base.event_name,
+                        pickup_secs = %fmt_secs(pickup), "job started");
                 }
             }
             for c in &msg.job_completed {
+                self.blocked.remove(&c.base.job_id);
                 if let Some(d) = self.pool.remove(&c.runner_name, now) {
-                    self.record(&d, &format!("job {}", c.result));
+                    let job_secs = secs_between(c.base.runner_assign_time, c.base.finish_time);
+                    self.record(&d, &format!("job {}", c.result), job_secs);
                     self.stop_in_background(d.runner.instance_id);
                 }
             }
@@ -258,6 +290,22 @@ impl rgha_scaleset::Scaler for ClassScaler {
         self.reap().await;
         Ok(())
     }
+}
+
+/// The service sends `0001-01-01T00:00:00Z` for unset timestamps.
+fn real(t: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    t.filter(|t| t.year() >= 2000)
+}
+
+fn secs_between(from: Option<DateTime<Utc>>, to: Option<DateTime<Utc>>) -> Option<f64> {
+    match (real(from), real(to)) {
+        (Some(a), Some(b)) if b >= a => Some((b - a).num_milliseconds() as f64 / 1000.0),
+        _ => None,
+    }
+}
+
+fn fmt_secs(s: Option<f64>) -> String {
+    s.map(|s| format!("{s:.1}")).unwrap_or_else(|| "-".into())
 }
 
 async fn start_one(
@@ -274,6 +322,7 @@ async fn start_one(
         class: class.name.clone(),
         jit_config: jit.encoded_jit_config,
         cpu: class.cpu,
+        cpu_limit: class.cpu_limit.unwrap_or(class.cpu),
         memory_mib: class.memory_mib,
         timeout: class.sandbox_timeout(),
         network: Network::for_class(class),
@@ -285,5 +334,22 @@ async fn start_one(
             let _ = client.remove_runner(jit.runner.id).await;
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(s: &str) -> Option<DateTime<Utc>> {
+        Some(s.parse().unwrap())
+    }
+
+    #[test]
+    fn zero_timestamps_are_ignored() {
+        assert_eq!(secs_between(ts("0001-01-01T00:00:00Z"), ts("2026-10-04T02:28:13.452Z")), None);
+        assert_eq!(secs_between(ts("2026-10-04T02:28:08.055Z"), ts("2026-10-04T02:28:13.452Z")), Some(5.397));
+        assert_eq!(secs_between(ts("2026-10-04T02:28:13Z"), ts("2026-10-04T02:28:08Z")), None);
+        assert_eq!(secs_between(None, ts("2026-10-04T02:28:08Z")), None);
     }
 }

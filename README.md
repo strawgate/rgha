@@ -26,6 +26,20 @@ job: 20s (+10s overhead) at 0.25 cores / 512 MiB
   ratio         : 15.2x
 ```
 
+Measured on this repo's [demo workflow](.github/workflows/rgha-demo.yml)
+(checkout + a few shell steps) with Modal, `cpu = 0.25`, `cpu_limit = 2.0`,
+1 GiB, scale-to-zero:
+
+| | rgha on Modal | GitHub-hosted 2-core |
+|---|---|---|
+| Runner online after GitHub assigns the job | 3–5 s (cold sandbox) | n/a |
+| Job duration | 6–8 s | — |
+| Billed sandbox lifetime | 9–13 s | 60 s (1 min minimum) |
+| Cost per job | ≤ $0.0011 (priced at the 2-core cap) | $0.006 |
+
+Without the burst cap (`cpu_limit = cpu = 0.25`), the .NET runner and Node
+actions are CPU-starved: pickup took 8–10 s and the same job took 14–45 s.
+
 The advantage shrinks for long, bigger jobs: a 3-minute job at 1 Modal core
 (2 vCPU) / 4 GiB is only ~1.4× cheaper than a 2-core hosted runner. Standard GitHub-hosted runners are **free for public repos**, so
 the cost win applies to private repos, to larger runners, and to anyone who
@@ -78,7 +92,7 @@ that persists on the machine. rgha's design answers that directly:
 |---|---|
 | Persistence between jobs | One sandbox per job, destroyed afterwards. JIT runner registrations are single-use. |
 | Host or kernel escape | Modal gVisor (user-space kernel) or VM runtime. Locally, gVisor (`runsc`) or Kata. **Plain runc is refused for untrusted classes.** |
-| Fork PR picks a powerful runner | `runs-on` labels are attacker-controlled, so trust never comes from labels. Each class has a **policy** over server-side job fields (event, repo, workflow ref). `trust = "trusted"` classes never take `pull_request*` events or `refs/pull/*` workflow refs. Rejected jobs are never acquired. |
+| Fork PR picks a powerful runner | `runs-on` labels are attacker-controlled, so trust never comes from labels. Each class has a **policy** over server-side job fields (event, repo, workflow ref). `trust = "trusted"` classes never take `pull_request*` events or `refs/pull/*` workflow refs. GitHub assigns jobs to a scale set directly, so a rejected job's **workflow run is cancelled** (verified live: cancelled in ~4 s, no runner started), and it is excluded from the runner count. Trusted classes default to `min_idle = 0` so no warm runner can grab a job before it is checked. |
 | Controller credential theft | The GitHub App key and Modal token never enter a sandbox. The sandbox receives only a JIT config, via an ephemeral Modal Secret (never argv or the sandbox definition). |
 | Exfiltration, scanning, crypto mining | `network = "github-only"` (or an allowlist) is enforced by Modal outside the sandbox. Per-class CPU/memory caps, max job time, and `max_runners` bound abuse. |
 

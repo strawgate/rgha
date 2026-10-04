@@ -118,6 +118,10 @@ pub struct ClassConfig {
     /// CPU in the backend's unit (Modal: physical cores; Docker: CPUs).
     #[serde(default = "default_cpu")]
     pub cpu: f64,
+    /// Hard CPU cap; may exceed `cpu` to let boot and bursty steps go faster.
+    /// Modal bills max(request, usage), so bursts cost only what they use.
+    /// Default: same as `cpu`.
+    pub cpu_limit: Option<f64>,
     #[serde(default = "default_memory")]
     pub memory_mib: u32,
     #[serde(default = "default_max_runners")]
@@ -141,6 +145,9 @@ pub struct ClassConfig {
     pub github_equivalent_per_min: f64,
     #[serde(default)]
     pub policy: Policy,
+    /// See the min_idle check in `Config::validate`.
+    #[serde(default)]
+    pub allow_warm_trusted: bool,
 }
 
 fn default_cpu() -> f64 {
@@ -217,6 +224,17 @@ impl Config {
             };
             if c.cpu <= 0.0 || c.memory_mib == 0 {
                 bail!("class {:?}: cpu and memory_mib must be positive", c.name);
+            }
+            if c.cpu_limit.is_some_and(|l| l < c.cpu) {
+                bail!("class {:?}: cpu_limit must be >= cpu", c.name);
+            }
+            if c.policy.trust == crate::policy::Trust::Trusted && c.min_idle > 0 && !c.allow_warm_trusted {
+                bail!(
+                    "class {:?}: trusted classes default to min_idle = 0. GitHub assigns jobs to a scale set before \
+                     rgha can check them, so a warm runner could start a disallowed job before rgha cancels it. \
+                     Set allow_warm_trusted = true to accept that race",
+                    c.name
+                );
             }
             if c.min_idle > c.max_runners {
                 bail!("class {:?}: min_idle exceeds max_runners", c.name);

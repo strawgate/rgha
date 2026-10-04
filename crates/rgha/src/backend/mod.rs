@@ -48,6 +48,7 @@ pub struct RunnerSpec {
     pub class: String,
     pub jit_config: String,
     pub cpu: f64,
+    pub cpu_limit: f64,
     pub memory_mib: u32,
     pub timeout: Duration,
     pub network: Network,
@@ -60,6 +61,7 @@ impl std::fmt::Debug for RunnerSpec {
             .field("class", &self.class)
             .field("jit_config", &"<redacted>")
             .field("cpu", &self.cpu)
+            .field("cpu_limit", &self.cpu_limit)
             .field("memory_mib", &self.memory_mib)
             .field("timeout", &self.timeout)
             .field("network", &self.network)

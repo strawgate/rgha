@@ -401,6 +401,26 @@ impl Client {
         }
     }
 
+    /// Cancels a workflow run via the REST API (needs Actions: write). Used to
+    /// enforce policy on jobs the service assigned to a scale set directly.
+    pub async fn cancel_workflow_run(&self, owner: &str, repo: &str, run_id: i64) -> Result<()> {
+        let req = self
+            .inner
+            .http
+            .post(self.api_url(&format!("/repos/{owner}/{repo}/actions/runs/{run_id}/cancel")))
+            .header("Accept", "application/vnd.github+json")
+            .header("Authorization", self.github_bearer().await?)
+            .header("User-Agent", &self.inner.user_agent)
+            .build()
+            .map_err(Error::build)?;
+        let resp = self.send(req).await?;
+        // 409: the run already finished or is already being cancelled.
+        if resp.status().as_u16() == 409 {
+            return Ok(());
+        }
+        expect_status(resp, 202).await
+    }
+
     /// Deregisters a runner. The service refuses to remove a runner that is
     /// running a job, which makes this a safe "reap only if idle" primitive.
     pub async fn remove_runner(&self, runner_id: i64) -> Result<()> {

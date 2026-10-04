@@ -30,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         runtime: None,
         regions: vec![],
         tags: HashMap::from([("rgha".into(), "smoke".into())]),
+        enable_snapshot: false,
     };
     let id = client.sandbox_create(&app_id, &spec).await?;
     println!("sandbox={id} create_rpc={:?}", t1.elapsed());

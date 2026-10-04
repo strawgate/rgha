@@ -40,6 +40,8 @@ pub enum Error {
     Rpc(#[from] tonic::Status),
     #[error("modal image build failed: {0}")]
     ImageBuild(String),
+    #[error("modal sandbox: {0}")]
+    Sandbox(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -85,6 +87,8 @@ pub struct SandboxSpec {
     pub runtime: Option<String>,
     pub regions: Vec<String>,
     pub tags: HashMap<String, String>,
+    /// Allow memory snapshots of this Sandbox (alpha).
+    pub enable_snapshot: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +238,8 @@ impl Client {
 
         let mut result = resp.result.filter(|r| r.status != pb::generic_result::GenericStatus::Unspecified as i32);
         let mut last_entry_id = String::new();
+        // Tail of the build output, surfaced if the build fails.
+        let mut log_tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
         while result.is_none() {
             let mut stream = self
                 .rpc()
@@ -242,13 +248,22 @@ impl Client {
                     image_id: resp.image_id.clone(),
                     timeout: 55.0,
                     last_entry_id: last_entry_id.clone(),
-                    include_logs_for_finished: false,
+                    include_logs_for_finished: true,
                 })
                 .await?
                 .into_inner();
             while let Some(item) = stream.message().await? {
                 if !item.entry_id.is_empty() {
                     last_entry_id = item.entry_id.clone();
+                }
+                for log in &item.task_logs {
+                    for line in log.data.lines().filter(|l| !l.trim().is_empty()) {
+                        tracing::debug!(target: "rgha_modal::image_build", "{line}");
+                        log_tail.push_back(line.to_string());
+                        if log_tail.len() > 40 {
+                            log_tail.pop_front();
+                        }
+                    }
                 }
                 if let Some(r) = item.result
                     && r.status != pb::generic_result::GenericStatus::Unspecified as i32
@@ -260,9 +275,13 @@ impl Client {
         }
         let result = result.expect("loop exits only with a result");
         if result.status != pb::generic_result::GenericStatus::Success as i32 {
+            let tail: Vec<String> = log_tail.into_iter().collect();
             return Err(Error::ImageBuild(format!(
-                "image {} status {}: {}",
-                resp.image_id, result.status, result.exception
+                "image {} status {}: {}\n--- build log tail ---\n{}",
+                resp.image_id,
+                result.status,
+                result.exception,
+                tail.join("\n")
             )));
         }
         Ok(resp.image_id)
@@ -305,6 +324,7 @@ impl Client {
             network_access: Some(spec.network.to_proto()),
             runtime: spec.runtime.clone(),
             name: Some(spec.name.clone()),
+            enable_snapshot: spec.enable_snapshot,
             scheduler_placement: (!spec.regions.is_empty())
                 .then(|| pb::SchedulerPlacement { regions: spec.regions.clone(), ..Default::default() }),
             ..Default::default()
@@ -321,6 +341,75 @@ impl Client {
             .await?
             .into_inner();
         Ok(resp.sandbox_id)
+    }
+
+    /// Waits until the Sandbox is scheduled and running (or `timeout`).
+    pub async fn sandbox_wait_running(&self, sandbox_id: &str, timeout: Duration) -> Result<()> {
+        let resp = self
+            .rpc()
+            .await?
+            .sandbox_get_task_id(pb::SandboxGetTaskIdRequest {
+                sandbox_id: sandbox_id.to_string(),
+                timeout: Some(timeout.as_secs_f32()),
+                wait_until_ready: true,
+            })
+            .await?
+            .into_inner();
+        if let Some(r) = resp.task_result
+            && r.status != pb::generic_result::GenericStatus::Unspecified as i32
+            && r.status != pb::generic_result::GenericStatus::Success as i32
+        {
+            return Err(Error::Sandbox(format!("sandbox {sandbox_id} failed to start: {}", r.exception)));
+        }
+        Ok(())
+    }
+
+    /// Takes a memory snapshot (RAM + filesystem; open TCP connections are
+    /// closed). The Sandbox must have been created with `enable_snapshot`.
+    pub async fn sandbox_snapshot(&self, sandbox_id: &str) -> Result<String> {
+        let snapshot_id = self
+            .rpc()
+            .await?
+            .sandbox_snapshot(pb::SandboxSnapshotRequest { sandbox_id: sandbox_id.to_string() })
+            .await?
+            .into_inner()
+            .snapshot_id;
+        loop {
+            let r = self
+                .rpc()
+                .await?
+                .sandbox_snapshot_wait(pb::SandboxSnapshotWaitRequest {
+                    snapshot_id: snapshot_id.clone(),
+                    timeout: 55.0,
+                })
+                .await?
+                .into_inner()
+                .result;
+            match r {
+                Some(r) if r.status == pb::generic_result::GenericStatus::Success as i32 => return Ok(snapshot_id),
+                Some(r) if r.status != pb::generic_result::GenericStatus::Unspecified as i32 => {
+                    return Err(Error::Sandbox(format!("snapshot {snapshot_id} failed: {}", r.exception)));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Restores a memory snapshot into a new running Sandbox; returns its id.
+    pub async fn sandbox_restore(&self, snapshot_id: &str) -> Result<String> {
+        let sandbox_id = self
+            .rpc()
+            .await?
+            .sandbox_restore(pb::SandboxRestoreRequest {
+                snapshot_id: snapshot_id.to_string(),
+                sandbox_name_override_type: pb::sandbox_restore_request::SandboxNameOverrideType::None as i32,
+                ..Default::default()
+            })
+            .await?
+            .into_inner()
+            .sandbox_id;
+        self.sandbox_wait_running(&sandbox_id, Duration::from_secs(55)).await?;
+        Ok(sandbox_id)
     }
 
     pub async fn sandbox_terminate(&self, sandbox_id: &str) -> Result<()> {

@@ -6,6 +6,8 @@ mod backend;
 mod config;
 mod controller;
 mod cost;
+mod image;
+mod lab;
 mod metrics;
 mod policy;
 mod pool;
@@ -50,6 +52,14 @@ enum Cmd {
         #[arg(long)]
         offline: bool,
     },
+    /// Experiments (see lab.rs).
+    #[command(hide = true)]
+    Lab {
+        #[arg(short, long, env = "RGHA_CONFIG", default_value = "rgha.toml")]
+        config: PathBuf,
+        #[command(subcommand)]
+        experiment: LabCmd,
+    },
     /// Compare per-second sandbox cost with a per-minute GitHub-hosted runner.
     Estimate {
         /// Job duration in seconds.
@@ -66,6 +76,16 @@ enum Cmd {
         #[arg(long, default_value_t = cost::GITHUB_LINUX_2CORE_PER_MIN)]
         github_per_min: f64,
     },
+}
+
+#[derive(Subcommand)]
+enum LabCmd {
+    /// Register a runner, wait until it's online, memory-snapshot it, stop it.
+    HibernatePrepare { class: String },
+    /// Restore a runner snapshot into a running sandbox.
+    Restore { backend: String, snapshot_id: String },
+    /// Terminate a sandbox and delete a class's scale set (experiment cleanup).
+    Cleanup { backend: String, class: String, sandbox_id: Option<String> },
 }
 
 fn credentials(cfg: &config::GitHub) -> anyhow::Result<Credentials> {
@@ -133,6 +153,16 @@ async fn main() -> anyhow::Result<()> {
                 println!("  ratio         : {:.1}x", gh / sandbox);
             }
             Ok(())
+        }
+        Cmd::Lab { config, experiment } => {
+            let cfg = Config::load(&config)?;
+            match experiment {
+                LabCmd::HibernatePrepare { class } => lab::hibernate_prepare(&cfg, &github_client(&cfg)?, &class).await,
+                LabCmd::Restore { backend, snapshot_id } => lab::restore(&cfg, &backend, &snapshot_id).await,
+                LabCmd::Cleanup { backend, class, sandbox_id } => {
+                    lab::cleanup(&cfg, &github_client(&cfg)?, &backend, &class, sandbox_id.as_deref()).await
+                }
+            }
         }
         Cmd::Check { config, offline } => {
             let cfg = Config::load(&config)?;

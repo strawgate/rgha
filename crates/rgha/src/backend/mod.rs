@@ -52,6 +52,7 @@ pub struct RunnerSpec {
     pub cpu: f64,
     pub cpu_limit: f64,
     pub memory_mib: u32,
+    pub memory_limit_mib: u32,
     pub timeout: Duration,
     pub network: Network,
 }
@@ -65,6 +66,7 @@ impl std::fmt::Debug for RunnerSpec {
             .field("cpu", &self.cpu)
             .field("cpu_limit", &self.cpu_limit)
             .field("memory_mib", &self.memory_mib)
+            .field("memory_limit_mib", &self.memory_limit_mib)
             .field("timeout", &self.timeout)
             .field("network", &self.network)
             .finish()
@@ -103,6 +105,13 @@ fn parse_key_file(text: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+/// Docker layer commands, for experiments that build the image themselves.
+pub fn modal_docker_commands() -> Vec<String> {
+    modal::DOCKER_IMAGE_COMMANDS.iter().map(|c| c.to_string()).collect()
+}
+
+pub use modal::sandbox_spec as modal_sandbox_spec;
+
 fn expand_home(path: &str) -> String {
     match (path.strip_prefix("~/"), std::env::var("HOME")) {
         (Some(rest), Ok(home)) => format!("{home}/{rest}"),
@@ -112,21 +121,24 @@ fn expand_home(path: &str) -> String {
 
 pub async fn build(name: &str, cfg: &BackendConfig) -> anyhow::Result<Arc<dyn Backend>> {
     let backend: Arc<dyn Backend> = match cfg {
-        BackendConfig::Modal { app, image, image_commands, profile, runtime, regions, docker, .. } => Arc::new(
-            ModalBackend::connect(
-                name,
-                ModalSettings {
-                    app,
-                    image,
-                    image_commands,
-                    profile: profile.as_deref(),
-                    runtime: runtime.clone(),
-                    regions: regions.clone(),
-                    docker: *docker,
-                },
+        BackendConfig::Modal { app, image, image_commands, profile, runtime, regions, docker, preload, .. } => {
+            Arc::new(
+                ModalBackend::connect(
+                    name,
+                    ModalSettings {
+                        app,
+                        image,
+                        image_commands,
+                        profile: profile.as_deref(),
+                        runtime: runtime.clone(),
+                        regions: regions.clone(),
+                        docker: *docker,
+                        preload,
+                    },
+                )
+                .await?,
             )
-            .await?,
-        ),
+        }
         BackendConfig::Docker { image, runtime, bin, .. } => Arc::new(DockerBackend::new(bin, image, runtime.clone())),
         BackendConfig::Daytona { api_url, api_key_env, api_key_file, image, snapshot, target, disk_gib, .. } => {
             let key = match std::env::var(api_key_env) {

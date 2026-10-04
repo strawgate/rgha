@@ -148,6 +148,22 @@ pub struct RunnerReference {
     pub name: String,
     #[serde(default)]
     pub runner_scale_set_id: i64,
+    /// Runner status. The agents API returns a string (`"online"`), while
+    /// other endpoints return the numeric TaskAgentStatus (2 = online).
+    #[serde(default)]
+    pub status: serde_json::Value,
+    #[serde(default)]
+    pub busy: bool,
+}
+
+impl RunnerReference {
+    pub fn is_online(&self) -> bool {
+        match &self.status {
+            serde_json::Value::String(s) => s.eq_ignore_ascii_case("online"),
+            serde_json::Value::Number(n) => n.as_i64() == Some(2),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -261,6 +277,19 @@ mod tests {
         assert_eq!(msg.job_available[0].base.request_labels, vec!["rgha-small"]);
         assert_eq!(msg.job_started[0].runner_name, "r-1");
         assert_eq!(msg.job_completed[0].result, "succeeded");
+    }
+
+    #[test]
+    fn runner_status_accepts_string_or_number() {
+        let jit: JitRunnerConfig = serde_json::from_str(
+            r#"{"runner":{"id":1,"name":"r","runnerScaleSetId":4,"status":0},"encodedJITConfig":"x"}"#,
+        )
+        .unwrap();
+        assert!(!jit.runner.is_online());
+        let r: RunnerReference = serde_json::from_str(r#"{"id":1,"name":"r","status":"online"}"#).unwrap();
+        assert!(r.is_online());
+        let r: RunnerReference = serde_json::from_str(r#"{"id":1,"name":"r","status":2}"#).unwrap();
+        assert!(r.is_online());
     }
 
     #[test]

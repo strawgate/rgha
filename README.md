@@ -32,13 +32,16 @@ Measured on this repo's [demo workflow](.github/workflows/rgha-demo.yml)
 
 | | rgha on Modal | GitHub-hosted 2-core |
 |---|---|---|
-| Runner online after GitHub assigns the job | 3–5 s (cold sandbox) | n/a |
+| Runner online after GitHub assigns the job | 0.1–0.2 s warm (`min_idle = 1`), 3–5 s cold | n/a |
 | Job duration | 6–8 s | — |
 | Billed sandbox lifetime | 9–13 s | 60 s (1 min minimum) |
 | Cost per job | ≤ $0.0011 (priced at the 2-core cap) | $0.006 |
 
 Without the burst cap (`cpu_limit = cpu = 0.25`), the .NET runner and Node
 actions are CPU-starved: pickup took 8–10 s and the same job took 14–45 s.
+
+**Docker-in-job** works on Modal's VM runtime (`runtime = "vm"`, `docker = true`):
+`docker run hello-world` passed with about 10 s cold pickup.
 
 The same job on **Daytona** (1 vCPU / 1 GiB, cached image): runner online
 3.7 s after assignment, job 5.5 s, sandbox billed for 7.7 s, about $0.00014.
@@ -81,10 +84,12 @@ cp examples/rgha.toml rgha.toml         # edit github.url and classes
 export GITHUB_TOKEN=...                  # or configure a GitHub App (recommended)
 modal token new                          # Modal credentials in ~/.modal.toml
 cargo run --release -p rgha -- check     # validates auth, runner group, backends
-cargo run --release -p rgha -- run
+cargo run --release -p rgha -- run --metrics-addr 127.0.0.1:9464
 ```
 
-Then use `runs-on: rgha-tiny` in a workflow.
+Then use `runs-on: rgha-tiny` in a workflow. To run it as a service (container
+image, systemd, GitHub App permissions, metrics, sizing), see
+[docs/operations.md](docs/operations.md).
 
 ## Security model (public repos)
 
@@ -96,7 +101,7 @@ that persists on the machine. rgha's design answers that directly:
 |---|---|
 | Persistence between jobs | One sandbox per job, destroyed afterwards. JIT runner registrations are single-use. |
 | Host or kernel escape | Modal gVisor (user-space kernel) or VM runtime. Daytona `linux-vm` snapshots. Locally, gVisor (`runsc`) or Kata. **Shared-kernel options (plain runc, Daytona's container class) are refused for untrusted classes** unless explicitly opted in. |
-| Fork PR picks a powerful runner | `runs-on` labels are attacker-controlled, so trust never comes from labels. Each class has a **policy** over server-side job fields (event, repo, workflow ref). `trust = "trusted"` classes never take `pull_request*` events or `refs/pull/*` workflow refs. GitHub assigns jobs to a scale set directly, so a rejected job's **workflow run is cancelled** (verified live: cancelled in ~4 s, no runner started), and it is excluded from the runner count. Trusted classes default to `min_idle = 0` so no warm runner can grab a job before it is checked. |
+| Fork PR picks a powerful runner | `runs-on` labels are attacker-controlled, so trust never comes from labels. Each class has a **policy** over server-side job fields (event, repo, workflow ref). `trust = "trusted"` classes never take `pull_request*` events or `refs/pull/*` workflow refs. GitHub assigns jobs to a scale set directly, so a rejected job's **workflow run is cancelled** and the job is excluded from the runner count. Verified live with a real PR aimed at the trusted Docker class: the run was cancelled and no runner started. Trusted classes default to `min_idle = 0`, so no warm runner can grab a job before it is checked. |
 | Controller credential theft | The GitHub App key and Modal token never enter a sandbox. The sandbox receives only a JIT config, via an ephemeral Modal Secret (never argv or the sandbox definition). |
 | Exfiltration, scanning, crypto mining | `network = "github-only"` (or an allowlist) is enforced by Modal outside the sandbox. Per-class CPU/memory caps, max job time, and `max_runners` bound abuse. |
 
@@ -113,13 +118,13 @@ VM-class snapshots needs an API key with snapshot permissions.
 ## Status
 
 Early. Live-tested against real GitHub jobs: the scale set protocol client,
-the Modal backend, the Daytona backend, policy enforcement (run cancellation),
-the pool scaler, and the cost ledger. The docker backend is unit-tested only.
-Planned:
+the Modal backend (gVisor, warm pools, VM runtime with Docker), the Daytona
+backend, policy enforcement on real PRs, the pool scaler, Prometheus metrics,
+and the cost ledger. The local docker backend and GitHub App auth are
+unit-tested only. Planned:
 
 - [ ] Firecracker / Cloud Hypervisor backend for bare-metal Linux hosts
 - [ ] Cloudflare Containers backend (Firecracker microVM per job, CPU billed on usage)
-- [ ] Prometheus metrics (queue time, boot time, cost per class)
 - [ ] Network allowlists for the local backend
 - [ ] Fork detection via the REST API (head repo ≠ base repo) for finer policies
 

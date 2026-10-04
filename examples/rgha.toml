@@ -14,7 +14,14 @@ token_env = "GITHUB_TOKEN"                  # PAT fallback when no App is config
 type = "modal"
 app = "rgha"
 image = "ghcr.io/actions/actions-runner:latest"
-# runtime = "vm"   # Modal's alpha VM runtime: real kernel, Docker-in-job
+# image_commands = ["USER root", "RUN apt-get update && apt-get install -y build-essential"]
+
+# Modal VM runtime (alpha): real kernel, so jobs can use Docker.
+[backends.modal-vm]
+type = "modal"
+app = "rgha"
+runtime = "vm"
+docker = true      # start dockerd in each sandbox before the runner
 
 [backends.daytona]
 type = "daytona"
@@ -33,7 +40,7 @@ cpu = 0.125              # Modal physical cores (1 core = 2 vCPU), the billed fl
 cpu_limit = 2.0          # burst cap: ~3x faster runner boot; billed by actual usage
 memory_mib = 512
 max_runners = 20
-min_idle = 0             # scale to zero: pay only while jobs run (set 1+ for ~instant pickup)
+min_idle = 1             # one warm runner: ~0.1s pickup; 0 = scale to zero (~3-5s pickup)
 max_job_minutes = 10
 network = "github-only"  # egress limited to GitHub runner endpoints
 [class.policy]
@@ -47,6 +54,20 @@ cpu = 1.0
 memory_mib = 4096
 max_runners = 10
 min_idle = 0             # warm runners on trusted classes need allow_warm_trusted (see README)
+max_job_minutes = 30
+network = "open"
+[class.policy]
+trust = "trusted"
+allowed_repos = ["strawgate/*"]
+
+# Docker-in-job on Modal's VM runtime, for trusted code.
+[[class]]
+name = "rgha-docker"
+backend = "modal-vm"
+cpu = 1.0
+cpu_limit = 2.0
+memory_mib = 4096
+max_runners = 4
 max_job_minutes = 30
 network = "open"
 [class.policy]

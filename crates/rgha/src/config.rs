@@ -214,6 +214,8 @@ pub const GITHUB_RUNNER_DOMAINS: &[&str] = &[
     "results-receiver.actions.githubusercontent.com",
     "*.blob.core.windows.net",
     "objects.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "release-assets.githubusercontent.com",
     "objects-origin.githubusercontent.com",
     "github-releases.githubusercontent.com",
     "github-registry-files.githubusercontent.com",

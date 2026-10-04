@@ -137,8 +137,13 @@ struct Inner {
 /// iptables rules (table, chain, args) that lock a slot's VM down to: TCP
 /// 443/80 via the egress proxy, DNS to `dns`, and `cidrs`. Applied with `-I`
 /// (so they precede the general rules) and removed with `-D`.
-pub(crate) fn egress_rules(slot: u32, dns: &str, cidrs: &[String]) -> Vec<(&'static str, &'static str, Vec<String>)> {
-    let veth = veth_name(slot);
+pub(crate) fn egress_rules(
+    subnet: [u8; 2],
+    slot: u32,
+    dns: &str,
+    cidrs: &[String],
+) -> Vec<(&'static str, &'static str, Vec<String>)> {
+    let veth = veth_name(subnet, slot);
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     let (tls, http) = (TLS_PORT.to_string(), HTTP_PORT.to_string());
     let mut rules = vec![
@@ -162,12 +167,14 @@ pub(crate) fn slot_addrs(subnet: [u8; 2], slot: u32) -> (Ipv4Addr, Ipv4Addr) {
     (Ipv4Addr::from(base + 1), Ipv4Addr::from(base + 2))
 }
 
-pub(crate) fn netns_name(slot: u32) -> String {
-    format!("rgha-{slot}")
+/// Names include the subnet's second octet so several Firecracker backends
+/// (distinct subnets) can share a host without colliding.
+pub(crate) fn netns_name(subnet: [u8; 2], slot: u32) -> String {
+    format!("rgha-{}-{slot}", subnet[1])
 }
 
-pub(crate) fn veth_name(slot: u32) -> String {
-    format!("rgha-v{slot}")
+pub(crate) fn veth_name(subnet: [u8; 2], slot: u32) -> String {
+    format!("rgha{}v{slot}", subnet[1])
 }
 
 pub(crate) fn boot_args(dns: &str) -> String {
@@ -363,15 +370,19 @@ impl Inner {
         let [a, b] = self.s.subnet;
         let subnet = format!("{a}.{b}.0.0/16");
         run_ok("sysctl", &["-qw", "net.ipv4.ip_forward=1"]).await;
+        // Shared chains are never flushed: other backends' subnets and running
+        // VMs' per-slot egress rules (which a restarted controller adopts) live
+        // there too. Each base rule is added only if missing.
         run_ok("iptables", &["-t", "nat", "-N", "RGHA-NAT"]).await;
         if run("iptables", &["-t", "nat", "-C", "POSTROUTING", "-j", "RGHA-NAT"]).await.is_err() {
             run("iptables", &["-t", "nat", "-A", "POSTROUTING", "-j", "RGHA-NAT"]).await?;
         }
-        run("iptables", &["-t", "nat", "-F", "RGHA-NAT"]).await?;
-        run("iptables", &["-t", "nat", "-A", "RGHA-NAT", "-s", &subnet, "-o", &up, "-j", "MASQUERADE"]).await?;
+        let masq = ["RGHA-NAT", "-s", &subnet, "-o", &up, "-j", "MASQUERADE"];
+        if run("iptables", &[&["-t", "nat", "-C"][..], &masq[..]].concat()).await.is_err() {
+            run("iptables", &[&["-t", "nat", "-A"][..], &masq[..]].concat()).await?;
+        }
 
         run_ok("iptables", &["-N", "RGHA-FWD"]).await;
-        run("iptables", &["-F", "RGHA-FWD"]).await?;
         let mut rules: Vec<Vec<String>> = vec![];
         let r = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         rules.push(r(&["-o", "rgha+", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]));
@@ -381,9 +392,10 @@ impl Inner {
         rules.push(r(&["-i", "rgha+", "-o", &up, "-j", "ACCEPT"]));
         rules.push(r(&["-i", "rgha+", "-j", "DROP"]));
         for rule in rules {
-            let mut args = vec!["-A", "RGHA-FWD"];
-            args.extend(rule.iter().map(String::as_str));
-            run("iptables", &args).await?;
+            let rule: Vec<&str> = rule.iter().map(String::as_str).collect();
+            if run("iptables", &[&["-C", "RGHA-FWD"][..], &rule[..]].concat()).await.is_err() {
+                run("iptables", &[&["-A", "RGHA-FWD"][..], &rule[..]].concat()).await?;
+            }
         }
         // Docker's FORWARD policy is DROP; its DOCKER-USER chain runs first.
         let hook = if run("iptables", &["-L", "DOCKER-USER", "-n"]).await.is_ok() { "DOCKER-USER" } else { "FORWARD" };
@@ -411,7 +423,7 @@ impl Inner {
     async fn apply_egress(&self, slot: u32, domains: &[String], cidrs: &[String]) -> anyhow::Result<()> {
         self.egress_started.get_or_try_init(|| self.egress.start()).await?;
         self.egress.register(slot_addrs(self.s.subnet, slot).1, domains.to_vec());
-        for (table, chain, rule) in egress_rules(slot, &self.s.dns, cidrs) {
+        for (table, chain, rule) in egress_rules(self.s.subnet, slot, &self.s.dns, cidrs) {
             let mut args = vec!["-t", table, "-I", chain];
             args.extend(rule.iter().map(String::as_str));
             run("iptables", &args).await?;
@@ -421,7 +433,7 @@ impl Inner {
 
     async fn remove_egress(&self, slot: u32, cidrs: &[String]) {
         self.egress.unregister(slot_addrs(self.s.subnet, slot).1);
-        for (table, chain, rule) in egress_rules(slot, &self.s.dns, cidrs) {
+        for (table, chain, rule) in egress_rules(self.s.subnet, slot, &self.s.dns, cidrs) {
             let mut args = vec!["-t", table, "-D", chain];
             args.extend(rule.iter().map(String::as_str));
             run_ok("iptables", &args).await;
@@ -430,8 +442,8 @@ impl Inner {
 
     /// Per-VM namespace: tap0 (identical in every VM) NATed onto a unique veth.
     async fn setup_netns(&self, slot: u32, tap_owner: Option<u32>) -> anyhow::Result<()> {
-        let ns = netns_name(slot);
-        let veth = veth_name(slot);
+        let ns = netns_name(self.s.subnet, slot);
+        let veth = veth_name(self.s.subnet, slot);
         let (host, inner) = slot_addrs(self.s.subnet, slot);
         run_ok("ip", &["netns", "del", &ns]).await;
         run("ip", &["netns", "add", &ns]).await?;
@@ -557,8 +569,8 @@ impl Inner {
     }
 
     async fn teardown(&self, id: &str, slot: u32) {
-        run_ok("ip", &["netns", "del", &netns_name(slot)]).await;
-        run_ok("ip", &["link", "del", &veth_name(slot)]).await;
+        run_ok("ip", &["netns", "del", &netns_name(self.s.subnet, slot)]).await;
+        run_ok("ip", &["link", "del", &veth_name(self.s.subnet, slot)]).await;
         let _ = tokio::fs::remove_dir_all(self.vms_dir().join(id)).await;
         let _ = tokio::fs::remove_dir_all(self.jail_dir(id)).await;
         self.free_slot(slot);
@@ -657,7 +669,7 @@ impl Inner {
         log: &Path,
     ) -> anyhow::Result<tokio::process::Child> {
         let log = std::fs::File::create(log)?;
-        let ns = netns_name(slot);
+        let ns = netns_name(self.s.subnet, slot);
         let mut cmd = match &layout.jail {
             Some(j) => {
                 let mut c = Command::new(&j.bin);
@@ -1018,8 +1030,10 @@ mod tests {
         assert_eq!(slot_addrs([10, 213], 1), (Ipv4Addr::new(10, 213, 0, 5), Ipv4Addr::new(10, 213, 0, 6)));
         assert_eq!(slot_addrs([10, 213], 64), (Ipv4Addr::new(10, 213, 1, 1), Ipv4Addr::new(10, 213, 1, 2)));
         assert_eq!(slot_addrs([10, 213], MAX_SLOTS - 1).1, Ipv4Addr::new(10, 213, 255, 254));
-        assert!(veth_name(MAX_SLOTS - 1).len() <= 15, "IFNAMSIZ");
-        assert!(veth_name(7).starts_with("rgha"), "matched by the rgha+ firewall rules");
+        assert!(veth_name([10, 255], MAX_SLOTS - 1).len() <= 15, "IFNAMSIZ");
+        assert!(veth_name([10, 213], 7).starts_with("rgha"), "matched by the rgha+ firewall rules");
+        assert_ne!(veth_name([10, 213], 0), veth_name([10, 214], 0), "backends on one host don't collide");
+        assert_ne!(netns_name([10, 213], 0), netns_name([10, 214], 0));
     }
 
     #[test]
@@ -1047,13 +1061,15 @@ mod tests {
 
     #[test]
     fn egress_rules_redirect_web_allow_dns_and_drop_the_rest() {
-        let r = egress_rules(5, "1.1.1.1", &["203.0.113.0/24".into()]);
+        let r = egress_rules([10, 213], 5, "1.1.1.1", &["203.0.113.0/24".into()]);
         let flat: Vec<String> = r.iter().map(|(t, c, a)| format!("{t} {c} {}", a.join(" "))).collect();
-        assert!(flat.contains(&"nat RGHA-PRE -i rgha-v5 -p tcp --dport 443 -j REDIRECT --to-ports 15443".to_string()));
-        assert!(flat.contains(&"nat RGHA-PRE -i rgha-v5 -p tcp --dport 80 -j REDIRECT --to-ports 15080".to_string()));
+        assert!(
+            flat.contains(&"nat RGHA-PRE -i rgha213v5 -p tcp --dport 443 -j REDIRECT --to-ports 15443".to_string())
+        );
+        assert!(flat.contains(&"nat RGHA-PRE -i rgha213v5 -p tcp --dport 80 -j REDIRECT --to-ports 15080".to_string()));
         // Each filter rule is inserted at the top, so the DROP (first) ends up last.
         let filter: Vec<&String> = flat.iter().filter(|f| f.starts_with("filter")).collect();
-        assert_eq!(filter.first().unwrap().as_str(), "filter RGHA-FWD -i rgha-v5 -j DROP");
+        assert_eq!(filter.first().unwrap().as_str(), "filter RGHA-FWD -i rgha213v5 -j DROP");
         assert!(filter.iter().any(|f| f.ends_with("-d 203.0.113.0/24 -j ACCEPT")));
         assert!(filter.iter().any(|f| f.contains("-p udp -d 1.1.1.1 --dport 53 -j ACCEPT")));
     }

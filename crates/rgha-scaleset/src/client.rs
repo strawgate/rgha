@@ -401,6 +401,20 @@ impl Client {
         }
     }
 
+    /// Fetches a workflow run via the REST API (needs Actions: read).
+    pub async fn get_workflow_run(&self, owner: &str, repo: &str, run_id: i64) -> Result<WorkflowRun> {
+        let req = self
+            .inner
+            .http
+            .get(self.api_url(&format!("/repos/{owner}/{repo}/actions/runs/{run_id}")))
+            .header("Accept", "application/vnd.github+json")
+            .header("Authorization", self.github_bearer().await?)
+            .header("User-Agent", &self.inner.user_agent)
+            .build()
+            .map_err(Error::build)?;
+        expect_json(self.send(req).await?, 200).await
+    }
+
     /// Cancels a workflow run via the REST API (needs Actions: write). Used to
     /// enforce policy on jobs the service assigned to a scale set directly.
     pub async fn cancel_workflow_run(&self, owner: &str, repo: &str, run_id: i64) -> Result<()> {

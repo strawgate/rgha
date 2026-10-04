@@ -464,3 +464,71 @@ async fn failing_backend_backs_off_instead_of_hot_looping() {
         attempts
     );
 }
+
+async fn mock_run(h: &Harness, status: u16, head: &str) {
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/actions/runs/4242"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+            "id": 4242, "event": "pull_request",
+            "repository": {"full_name": "o/r"}, "head_repository": {"full_name": head}
+        })))
+        .mount(&h.server)
+        .await;
+}
+
+fn pr_assigned(id: i64, job: &str) -> ScaleSetMessage {
+    ScaleSetMessage {
+        message_id: id,
+        statistics: stats(1),
+        job_assigned: vec![JobAssigned { base: base(job, "pull_request", PR) }],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn fork_pr_rejected_when_forks_disallowed_and_lookup_is_cached() {
+    let h = Harness::new().await;
+    mock_run(&h, 200, "someone/r").await;
+    let mut s = h.scaler(class("[policy]\nallow_fork_prs = false"));
+    s.scale(&h.session, Some(&pr_assigned(1, "j1"))).await.unwrap();
+    settle().await;
+    assert!(h.backend.running().is_empty());
+    assert_eq!(h.requests_to("/actions/runs/4242/cancel").await, 1);
+    // A second job from the same run reuses the cached lookup and the cancel.
+    s.scale(&h.session, Some(&pr_assigned(2, "j2"))).await.unwrap();
+    settle().await;
+    assert_eq!(h.requests_to("/actions/runs/4242").await, 1, "one REST lookup per run");
+    assert_eq!(h.requests_to("/actions/runs/4242/cancel").await, 1, "one cancel per run");
+}
+
+#[tokio::test]
+async fn same_repo_pr_accepted_when_forks_disallowed() {
+    let h = Harness::new().await;
+    mock_run(&h, 200, "o/r").await;
+    let mut s = h.scaler(class("[policy]\nallow_fork_prs = false"));
+    s.scale(&h.session, Some(&pr_assigned(1, "j1"))).await.unwrap();
+    settle().await;
+    assert_eq!(h.backend.running().len(), 1);
+    assert_eq!(h.requests_to("/cancel").await, 0);
+}
+
+#[tokio::test]
+async fn trusted_class_accepts_verified_same_repo_pr_only_when_enabled() {
+    let h = Harness::new().await;
+    mock_run(&h, 200, "o/r").await;
+    let mut s = h.scaler(class("[policy]\ntrust = \"trusted\"\nallow_same_repo_prs = true"));
+    s.scale(&h.session, Some(&pr_assigned(1, "j1"))).await.unwrap();
+    assert_eq!(h.backend.running().len(), 1);
+}
+
+#[tokio::test]
+async fn failed_lookup_fails_closed() {
+    let h = Harness::new().await;
+    mock_run(&h, 500, "o/r").await;
+    let mut s = h.scaler(class("[policy]\nallow_fork_prs = false"));
+    s.scale(&h.session, Some(&pr_assigned(1, "j1"))).await.unwrap();
+    settle().await;
+    assert!(h.backend.running().is_empty(), "unverified PR not run");
+    assert_eq!(h.requests_to("/actions/runs/4242/cancel").await, 1);
+    assert_eq!(h.requests_to("/actions/runs/4242").await, 3, "retried before failing closed");
+}

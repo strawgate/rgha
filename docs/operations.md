@@ -51,7 +51,7 @@ repos, install it, and set `app_client_id`, `app_installation_id` and
 |---|---|---|
 | Repository-level config URL | Administration: read & write | register scale sets / JIT runners |
 | Org-level config URL | Organization → Self-hosted runners: read & write | same, org-wide |
-| Both | Actions: read & write | cancel runs that a class policy rejects |
+| Both | Actions: read & write | cancel runs that a class policy rejects; look up runs for fork detection |
 | Both | Metadata: read | required by GitHub |
 
 A PAT (`token_env`) also works: classic `repo` (plus `admin:org` for org
@@ -156,10 +156,35 @@ Enabled with `--metrics-addr` / `RGHA_METRICS_ADDR`. All metrics are labelled `c
 Useful alerts: `increase(rgha_runner_start_failures_total[10m]) > 0`;
 `histogram_quantile(0.9, rate(rgha_pickup_seconds_bucket[1h])) > 30`.
 
+## Class policies
+
+Each class decides which jobs it takes, using fields GitHub fills in on the
+server: event, repository and workflow ref. It never uses the `runs-on` label,
+which a fork PR author controls. A rejected job's workflow run is cancelled.
+
+```toml
+[class.policy]
+trust = "untrusted"            # or "trusted": never PR refs, only branch/tag code
+allowed_events = ["push", "pull_request"]   # default: all (untrusted) / branch events (trusted)
+denied_events = ["pull_request_target"]
+allowed_repos = ["my-org/*"]
+allowed_workflow_refs = ["my-org/*/.github/workflows/*@refs/heads/main"]
+allow_fork_prs = false         # default: true (untrusted), false (trusted)
+allow_same_repo_prs = true     # trusted only: also take PRs from branches of the same repo
+```
+
+The scale set message doesn't say whether a PR comes from a fork. When the
+decision depends on it, rgha looks the run up through the REST API (cached
+per run) and compares the head and base repositories. If the lookup fails
+after retries, the job is rejected (fail closed). Verified on the testbed: a
+real fork PR was cancelled in 4 s on a class with `allow_fork_prs = false`,
+while the same-repo PR ran.
+
 ## Public-repo checklist
 
 - [ ] Untrusted classes: small `cpu`/`memory_mib`, `network = "github-only"`, short `max_job_minutes`
 - [ ] Trusted classes: `trust = "trusted"`, `allowed_repos`, `min_idle = 0`
+- [ ] Mid-tier classes (more CPU or open egress) for contributors only: `allow_fork_prs = false`
 - [ ] Repo setting: require approval for fork PR workflows from outside contributors
 - [ ] Runner group limited to the repos that use it
 - [ ] Alert on `rgha_policy_rejections_total`. It means someone pointed a PR at a trusted class.

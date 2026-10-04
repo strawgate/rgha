@@ -41,6 +41,27 @@ pub struct Policy {
     /// Globs over `job_workflow_ref`, e.g. `strawgate/*/.github/workflows/*@refs/heads/main`.
     #[serde(default)]
     pub allowed_workflow_refs: Vec<String>,
+    /// Accept pull requests whose head is in a fork. Default: true for
+    /// untrusted classes, false for trusted ones. When false, rgha looks the
+    /// run up (Actions: read) and rejects forks; if the lookup fails, the job
+    /// is rejected (fail closed).
+    pub allow_fork_prs: Option<bool>,
+    /// Trusted classes only: also accept pull requests from branches of the
+    /// same repository (their authors already have write access). Fork PRs
+    /// are still rejected.
+    #[serde(default)]
+    pub allow_same_repo_prs: bool,
+}
+
+/// What rgha learned about a job beyond the scale set message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JobContext {
+    /// `Some(true)` if the PR head is in a fork; `None` if unknown/not looked up.
+    pub fork: Option<bool>,
+}
+
+pub fn is_pull_request_event(event: &str) -> bool {
+    event.starts_with("pull_request")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,25 +71,46 @@ pub enum Decision {
 }
 
 impl Policy {
-    pub fn evaluate(&self, job: &JobMessageBase) -> Decision {
+    fn fork_prs_allowed(&self) -> bool {
+        self.allow_fork_prs.unwrap_or(self.trust == Trust::Untrusted)
+    }
+
+    /// True if the decision for this job depends on whether its PR is from a
+    /// fork, i.e. only then is the REST lookup worth making.
+    pub fn needs_fork_info(&self, job: &JobMessageBase) -> bool {
+        let accept = |fork| self.evaluate(job, JobContext { fork: Some(fork) }) == Decision::Acquire;
+        is_pull_request_event(&job.event_name) && accept(false) != accept(true)
+    }
+
+    pub fn evaluate(&self, job: &JobMessageBase, ctx: JobContext) -> Decision {
         let event = job.event_name.as_str();
+        let is_pr = is_pull_request_event(event);
+        let same_repo_pr = is_pr && ctx.fork == Some(false);
         if self.denied_events.iter().any(|e| e == event) {
             return Decision::Reject(format!("event {event:?} is denied"));
         }
         let allowed = match (&self.allowed_events, self.trust) {
             (Some(list), _) => list.iter().any(|e| e == event),
             (None, Trust::Untrusted) => true,
-            (None, Trust::Trusted) => TRUSTED_EVENTS.contains(&event),
+            (None, Trust::Trusted) => TRUSTED_EVENTS.contains(&event) || (self.allow_same_repo_prs && same_repo_pr),
         };
         if !allowed {
             return Decision::Reject(format!("event {event:?} is not allowed for this class"));
         }
         if self.trust == Trust::Trusted {
-            // A trusted class must never run code from a PR merge/head ref, even
-            // if someone adds `pull_request` to allowed_events by mistake.
+            // A trusted class never runs code from a PR ref, even if someone adds
+            // `pull_request` to allowed_events by mistake, unless it is a
+            // verified same-repo PR and allow_same_repo_prs is set.
             let git_ref = job.job_workflow_ref.rsplit_once('@').map(|(_, r)| r).unwrap_or("");
-            if git_ref.starts_with("refs/pull/") {
+            if git_ref.starts_with("refs/pull/") && !(self.allow_same_repo_prs && same_repo_pr) {
                 return Decision::Reject(format!("workflow ref {:?} is a pull request ref", job.job_workflow_ref));
+            }
+        }
+        if is_pr && !self.fork_prs_allowed() {
+            match ctx.fork {
+                Some(false) => {}
+                Some(true) => return Decision::Reject("pull request from a fork".into()),
+                None => return Decision::Reject("could not verify the pull request is not from a fork".into()),
             }
         }
         let repo = format!("{}/{}", job.owner_name, job.repository_name);
@@ -123,24 +165,30 @@ mod tests {
         }
     }
 
+    impl Policy {
+        fn evaluate_plain(&self, job: &JobMessageBase) -> Decision {
+            self.evaluate(job, JobContext::default())
+        }
+    }
+
     const MAIN: &str = "strawgate/rgha/.github/workflows/ci.yml@refs/heads/main";
     const PR: &str = "strawgate/rgha/.github/workflows/ci.yml@refs/pull/12/merge";
 
     #[test]
     fn untrusted_accepts_fork_prs() {
-        assert_eq!(Policy::default().evaluate(&job("pull_request", PR)), Decision::Acquire);
+        assert_eq!(Policy::default().evaluate_plain(&job("pull_request", PR)), Decision::Acquire);
     }
 
     #[test]
     fn trusted_rejects_pr_events_and_pr_refs() {
         let p = Policy { trust: Trust::Trusted, ..Default::default() };
-        assert_eq!(p.evaluate(&job("push", MAIN)), Decision::Acquire);
-        assert!(matches!(p.evaluate(&job("pull_request", PR)), Decision::Reject(_)));
-        assert!(matches!(p.evaluate(&job("pull_request_target", MAIN)), Decision::Reject(_)));
+        assert_eq!(p.evaluate_plain(&job("push", MAIN)), Decision::Acquire);
+        assert!(matches!(p.evaluate_plain(&job("pull_request", PR)), Decision::Reject(_)));
+        assert!(matches!(p.evaluate_plain(&job("pull_request_target", MAIN)), Decision::Reject(_)));
         // Even an explicit allowlist cannot let PR refs into a trusted class.
         let p =
             Policy { trust: Trust::Trusted, allowed_events: Some(vec!["pull_request".into()]), ..Default::default() };
-        assert!(matches!(p.evaluate(&job("pull_request", PR)), Decision::Reject(_)));
+        assert!(matches!(p.evaluate_plain(&job("pull_request", PR)), Decision::Reject(_)));
     }
 
     #[test]
@@ -150,17 +198,55 @@ mod tests {
             allowed_workflow_refs: vec!["*@refs/heads/main".into()],
             ..Default::default()
         };
-        assert_eq!(p.evaluate(&job("push", MAIN)), Decision::Acquire);
-        assert!(matches!(p.evaluate(&job("push", PR)), Decision::Reject(_)));
+        assert_eq!(p.evaluate_plain(&job("push", MAIN)), Decision::Acquire);
+        assert!(matches!(p.evaluate_plain(&job("push", PR)), Decision::Reject(_)));
         let mut other = job("push", MAIN);
         other.owner_name = "evil".into();
-        assert!(matches!(p.evaluate(&other), Decision::Reject(_)));
+        assert!(matches!(p.evaluate_plain(&other), Decision::Reject(_)));
+    }
+
+    fn ctx(fork: Option<bool>) -> JobContext {
+        JobContext { fork }
+    }
+
+    #[test]
+    fn fork_decision_table() {
+        let untrusted = Policy::default();
+        let no_forks = Policy { allow_fork_prs: Some(false), ..Default::default() };
+        let trusted = Policy { trust: Trust::Trusted, ..Default::default() };
+        let trusted_same_repo = Policy { trust: Trust::Trusted, allow_same_repo_prs: true, ..Default::default() };
+        let pr = job("pull_request", PR);
+        let push = job("push", MAIN);
+        let ok = |d: Decision| d == Decision::Acquire;
+
+        // untrusted: anything, no lookup needed
+        assert!(!untrusted.needs_fork_info(&pr));
+        assert!(ok(untrusted.evaluate(&pr, ctx(Some(true)))));
+        // untrusted without forks: same-repo only, unknown fails closed
+        assert!(no_forks.needs_fork_info(&pr));
+        assert!(!no_forks.needs_fork_info(&push));
+        assert!(ok(no_forks.evaluate(&pr, ctx(Some(false)))));
+        assert!(!ok(no_forks.evaluate(&pr, ctx(Some(true)))));
+        assert!(!ok(no_forks.evaluate(&pr, ctx(None))));
+        assert!(ok(no_forks.evaluate(&push, ctx(None))));
+        // trusted: never PRs by default, no lookup needed
+        assert!(!trusted.needs_fork_info(&pr));
+        assert!(!ok(trusted.evaluate(&pr, ctx(Some(false)))));
+        // trusted + allow_same_repo_prs: verified same-repo PRs only
+        assert!(trusted_same_repo.needs_fork_info(&pr));
+        assert!(ok(trusted_same_repo.evaluate(&pr, ctx(Some(false)))));
+        assert!(!ok(trusted_same_repo.evaluate(&pr, ctx(Some(true)))));
+        assert!(!ok(trusted_same_repo.evaluate(&pr, ctx(None))));
+        assert!(ok(trusted_same_repo.evaluate(&push, ctx(None))));
+        // explicitly allowing forks on a trusted class still can't bypass the PR-ref rule
+        let trusted_forks = Policy { trust: Trust::Trusted, allow_fork_prs: Some(true), ..Default::default() };
+        assert!(!ok(trusted_forks.evaluate(&pr, ctx(Some(true)))));
     }
 
     #[test]
     fn denied_events_win() {
         let p = Policy { denied_events: vec!["pull_request_target".into()], ..Default::default() };
-        assert!(matches!(p.evaluate(&job("pull_request_target", MAIN)), Decision::Reject(_)));
+        assert!(matches!(p.evaluate_plain(&job("pull_request_target", MAIN)), Decision::Reject(_)));
     }
 
     #[test]

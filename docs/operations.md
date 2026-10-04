@@ -161,6 +161,72 @@ Enabled with `--metrics-addr` / `RGHA_METRICS_ADDR`. All metrics are labelled `c
 Useful alerts: `increase(rgha_runner_start_failures_total[10m]) > 0`;
 `histogram_quantile(0.9, rate(rgha_pickup_seconds_bucket[1h])) > 30`.
 
+## Firecracker backend (self-hosted microVMs)
+
+Each job runs in its own Firecracker microVM on a KVM host, built from the
+same runner image and `preload` as the Modal backend. The extra cost per job
+is $0 on hardware you already have.
+
+**Host requirements:**
+- Linux with `/dev/kvm`: bare metal, or a cloud VM with nested virtualization.
+- `firecracker` and, recommended, `jailer`, from
+  [Firecracker releases](https://github.com/firecracker-microvm/firecracker/releases).
+- An uncompressed guest kernel. The Firecracker CI kernels work, e.g.
+  `firecracker-ci/v1.15/x86_64/vmlinux-6.1.155`.
+- Docker, used once to build the rootfs from the runner image.
+- rgha running as **root**, for tap devices, iptables and the jailer.
+
+```toml
+[backends.fc]
+type = "firecracker"
+kernel = "/var/lib/rgha/vmlinux"
+firecracker_bin = "/usr/local/bin/firecracker"
+jailer_bin = "/usr/local/bin/jailer"   # chroot + unprivileged uid (jailer_uid/gid, default 10000)
+state_dir = "/var/lib/rgha/firecracker"
+# subnet = "10.213.0.0/16"             # one /30 per VM
+# uplink = "eth0"                      # default: the default route's interface
+[backends.fc.preload]
+actions = ["actions/checkout@v5"]
+node = ["22"]
+
+[[class]]
+name = "rgha-fc"
+backend = "fc"
+cpu = 2.0            # vCPUs = ceil(cpu_limit or cpu)
+memory_mib = 2048    # guest RAM = memory_limit_mib or memory_mib
+```
+
+**How it works:**
+- **Rootfs:** built from the image, `preload` and the guest init, converted to
+  ext4, and cached under `state_dir` by content hash. The first build takes
+  minutes; later starts reuse it. Docker `ENV` is recorded into
+  `/etc/rgha/image.env` and re-applied in the guest.
+- **Registration token:** each VM gets a copy of the rootfs, and the
+  single-use JIT config arrives on a read-only raw drive, not the kernel
+  command line.
+- **Shutdown:** the guest powers off when the runner exits. rgha then removes
+  the tap device and disk, and keeps the console log under `state_dir/logs`.
+- **Restarts:** VM state lives in `state_dir/vms`. A restarted controller
+  adopts VMs that are still running and cleans up those that have exited.
+
+**Network isolation:** each VM gets a tap device and a /30 with NAT out of the
+uplink. Rules live in dedicated `RGHA-FWD` / `RGHA-NAT` chains;
+`RGHA-FWD` is inserted into `DOCKER-USER` when Docker is present. Guests
+cannot reach the host, RFC1918 ranges (your other VMs, Docker networks, LAN),
+CGNAT, or link-local/metadata addresses. Egress allowlists
+(`network = "github-only"`) are tracked in strawgate/rgha#22. To remove the
+rules:
+`iptables -D DOCKER-USER -j RGHA-FWD; iptables -D INPUT -i rgha+ -j DROP;
+iptables -t nat -D POSTROUTING -j RGHA-NAT`.
+
+**Measured** (on a host loaded at 74/72 cores, so timings are pessimistic):
+- The guest kernel reaches init in 0.8 s, and the runner is listening about 4 s after VM start.
+- Copying the rootfs per VM takes 2.3 s alone and contends when several VMs
+  start at once; copy-on-write and snapshot boots are tracked in strawgate/rgha#24.
+- Verified: shell, `setup-node`/npm, `setup-python`/PyPI and boot-profile jobs
+  ran in jailed microVMs (uid 10000, chroot); private ranges were blocked;
+  and a controller `kill -9` mid-job left no orphans.
+
 ## Class policies
 
 Each class decides which jobs it takes, using fields GitHub fills in on the

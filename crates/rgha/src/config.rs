@@ -104,6 +104,58 @@ pub enum BackendConfig {
         allow_container_class: bool,
         pricing: Option<Pricing>,
     },
+    /// One Firecracker microVM per job on this (KVM) host. Requires root.
+    Firecracker {
+        #[serde(default = "default_runner_image")]
+        image: String,
+        #[serde(default)]
+        image_commands: Vec<String>,
+        #[serde(default)]
+        preload: crate::image::Preload,
+        /// Guest kernel (uncompressed vmlinux), e.g. a Firecracker CI kernel.
+        kernel: String,
+        #[serde(default = "default_fc_bin")]
+        firecracker_bin: String,
+        /// Path to `jailer`; when set, VMs run chrooted as `jailer_uid`.
+        jailer_bin: Option<String>,
+        #[serde(default = "default_jailer_id")]
+        jailer_uid: u32,
+        #[serde(default = "default_jailer_id")]
+        jailer_gid: u32,
+        #[serde(default = "default_fc_state_dir")]
+        state_dir: String,
+        #[serde(default = "default_docker_bin")]
+        docker_bin: String,
+        #[serde(default = "default_rootfs_gib")]
+        rootfs_size_gib: u32,
+        /// A /16 for VM networks (one /30 per VM).
+        #[serde(default = "default_fc_subnet")]
+        subnet: String,
+        /// Host interface for NAT; default: the default route's.
+        uplink: Option<String>,
+        #[serde(default = "default_dns")]
+        dns: String,
+        pricing: Option<Pricing>,
+    },
+}
+
+fn default_fc_bin() -> String {
+    "firecracker".into()
+}
+fn default_fc_state_dir() -> String {
+    "/var/lib/rgha/firecracker".into()
+}
+fn default_rootfs_gib() -> u32 {
+    8
+}
+fn default_fc_subnet() -> String {
+    "10.213.0.0/16".into()
+}
+fn default_dns() -> String {
+    "1.1.1.1".into()
+}
+fn default_jailer_id() -> u32 {
+    10000
 }
 
 fn default_daytona_url() -> String {
@@ -132,6 +184,7 @@ impl BackendConfig {
             BackendConfig::Modal { pricing, .. } => pricing.unwrap_or(Pricing::MODAL_SANDBOX),
             BackendConfig::Docker { pricing, .. } => pricing.unwrap_or(Pricing::FREE),
             BackendConfig::Daytona { pricing, .. } => pricing.unwrap_or(Pricing::DAYTONA),
+            BackendConfig::Firecracker { pricing, .. } => pricing.unwrap_or(Pricing::FREE),
         }
     }
 }
@@ -336,6 +389,12 @@ impl Config {
                     c.backend
                 );
             }
+            if matches!(backend, BackendConfig::Firecracker { .. }) && c.network != NetworkMode::Open {
+                bail!(
+                    "class {:?}: network restrictions for the firecracker backend are not implemented yet (strawgate/rgha#22)",
+                    c.name
+                );
+            }
             if let BackendConfig::Docker { runtime, allow_insecure_runc, .. } = backend {
                 let isolated = runtime.as_deref().is_some_and(|r| r != "runc");
                 if c.policy.trust == crate::policy::Trust::Untrusted && !isolated && !allow_insecure_runc {
@@ -352,6 +411,10 @@ impl Config {
             }
         }
         for (name, b) in &self.backends {
+            if let BackendConfig::Firecracker { subnet, preload, .. } = b {
+                crate::backend::parse_fc_subnet(subnet).map_err(|e| anyhow::anyhow!("backend {name:?}: {e}"))?;
+                preload.validate().map_err(|e| anyhow::anyhow!("backend {name:?}: {e}"))?;
+            }
             if let BackendConfig::Modal { preload, .. } = b {
                 preload.validate().map_err(|e| anyhow::anyhow!("backend {name:?}: {e}"))?;
             }

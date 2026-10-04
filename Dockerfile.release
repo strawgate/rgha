@@ -1,0 +1,11 @@
+# Release image: packages the binaries built natively by the release workflow
+# (no in-image compile, no QEMU). Linux binaries are built on Ubuntu 22.04
+# (glibc 2.35), which runs on distroless Debian 12 (glibc 2.36).
+FROM gcr.io/distroless/cc-debian12:nonroot
+ARG TARGETARCH
+COPY dist/${TARGETARCH}/rgha /usr/local/bin/rgha
+ENV RGHA_CONFIG=/etc/rgha/rgha.toml \
+    RGHA_METRICS_ADDR=0.0.0.0:9464
+EXPOSE 9464
+ENTRYPOINT ["/usr/local/bin/rgha"]
+CMD ["run"]

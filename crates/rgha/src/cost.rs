@@ -20,6 +20,9 @@ impl Pricing {
     /// Modal Sandbox list prices (modal.com/pricing, checked 2026-10).
     pub const MODAL_SANDBOX: Pricing =
         Pricing { cpu_per_sec: 0.000_039_42, gib_per_sec: 0.000_006_67, min_billed_secs: 0.0 };
+    /// Daytona list prices per vCPU-second and GiB-second (daytona.io/pricing,
+    /// checked 2026-10). Daytona allocates whole vCPUs and GiB.
+    pub const DAYTONA: Pricing = Pricing { cpu_per_sec: 0.000_014, gib_per_sec: 0.000_004_5, min_billed_secs: 0.0 };
     /// Local/self-hosted capacity is already paid for.
     pub const FREE: Pricing = Pricing { cpu_per_sec: 0.0, gib_per_sec: 0.0, min_billed_secs: 0.0 };
 

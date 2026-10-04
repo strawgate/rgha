@@ -1,9 +1,9 @@
 # rgha
 
 **R**ust **G**itHub **A**ctions runner controller. Every job gets its own
-throwaway, per-second-billed sandbox (Modal today, local gVisor/Kata
-containers too), so short or low-CPU jobs cost a fraction of a
-per-minute runner and queue time stays low.
+throwaway, per-second-billed sandbox (Modal, Daytona, or local gVisor/Kata
+containers), so short or low-CPU jobs cost a fraction of a per-minute runner
+and queue time stays low.
 
 ```yaml
 jobs:
@@ -40,6 +40,9 @@ Measured on this repo's [demo workflow](.github/workflows/rgha-demo.yml)
 Without the burst cap (`cpu_limit = cpu = 0.25`), the .NET runner and Node
 actions are CPU-starved: pickup took 8–10 s and the same job took 14–45 s.
 
+The same job on **Daytona** (1 vCPU / 1 GiB, cached image): runner online
+3.7 s after assignment, job 5.5 s, sandbox billed for 7.7 s, about $0.00014.
+
 The advantage shrinks for long, bigger jobs: a 3-minute job at 1 Modal core
 (2 vCPU) / 4 GiB is only ~1.4× cheaper than a 2-core hosted runner. Standard GitHub-hosted runners are **free for public repos**, so
 the cost win applies to private repos, to larger runners, and to anyone who
@@ -53,6 +56,7 @@ GitHub ──long-poll──► rgha (one listener per class)
                         ├─ policy: acquire only jobs this class may run
                         ├─ pool: one runner per assigned job (+ optional warm buffer)
                         └─ backend ─┬─ Modal Sandbox (gVisor, or VM runtime)
+                                    ├─ Daytona sandbox (container, or linux-vm snapshot)
                                     └─ docker --runtime runsc|kata (local)
 sandbox: official actions/runner + single-use JIT config → 1 job → destroyed
 ```
@@ -91,7 +95,7 @@ that persists on the machine. rgha's design answers that directly:
 | Threat | Mitigation |
 |---|---|
 | Persistence between jobs | One sandbox per job, destroyed afterwards. JIT runner registrations are single-use. |
-| Host or kernel escape | Modal gVisor (user-space kernel) or VM runtime. Locally, gVisor (`runsc`) or Kata. **Plain runc is refused for untrusted classes.** |
+| Host or kernel escape | Modal gVisor (user-space kernel) or VM runtime. Daytona `linux-vm` snapshots. Locally, gVisor (`runsc`) or Kata. **Shared-kernel options (plain runc, Daytona's container class) are refused for untrusted classes** unless explicitly opted in. |
 | Fork PR picks a powerful runner | `runs-on` labels are attacker-controlled, so trust never comes from labels. Each class has a **policy** over server-side job fields (event, repo, workflow ref). `trust = "trusted"` classes never take `pull_request*` events or `refs/pull/*` workflow refs. GitHub assigns jobs to a scale set directly, so a rejected job's **workflow run is cancelled** (verified live: cancelled in ~4 s, no runner started), and it is excluded from the runner count. Trusted classes default to `min_idle = 0` so no warm runner can grab a job before it is checked. |
 | Controller credential theft | The GitHub App key and Modal token never enter a sandbox. The sandbox receives only a JIT config, via an ephemeral Modal Secret (never argv or the sandbox definition). |
 | Exfiltration, scanning, crypto mining | `network = "github-only"` (or an allowlist) is enforced by Modal outside the sandbox. Per-class CPU/memory caps, max job time, and `max_runners` bound abuse. |
@@ -101,16 +105,20 @@ for outside contributors, and restrict the runner group to the repos that need i
 
 Caveats: the GitHub runner allowlist includes `*.blob.core.windows.net`
 (used for logs and artifacts), which is broad. Modal's domain allowlist is
-beta and covers TLS on port 443 only. The Modal VM runtime is alpha.
+beta and covers TLS on port 443 only. The Modal VM runtime is alpha. On lower
+Daytona tiers, network policy is fixed at the organization level, so
+per-sandbox allowlists (`network = "github-only"`) are rejected; creating
+VM-class snapshots needs an API key with snapshot permissions.
 
 ## Status
 
-Early. Working today: the scale set protocol client, the Modal backend
-(live-tested), the docker backend, the policy engine, the pool scaler, and the
-cost ledger. Planned:
+Early. Live-tested against real GitHub jobs: the scale set protocol client,
+the Modal backend, the Daytona backend, policy enforcement (run cancellation),
+the pool scaler, and the cost ledger. The docker backend is unit-tested only.
+Planned:
 
 - [ ] Firecracker / Cloud Hypervisor backend for bare-metal Linux hosts
-- [ ] Daytona backend (per-second billing, VM class)
+- [ ] Cloudflare Containers backend (Firecracker microVM per job, CPU billed on usage)
 - [ ] Prometheus metrics (queue time, boot time, cost per class)
 - [ ] Network allowlists for the local backend
 - [ ] Fork detection via the REST API (head repo ≠ base repo) for finer policies

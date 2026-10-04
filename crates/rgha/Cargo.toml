@@ -17,6 +17,7 @@ async-trait.workspace = true
 chrono.workspace = true
 clap.workspace = true
 futures.workspace = true
+reqwest.workspace = true
 rgha-modal.workspace = true
 rgha-scaleset.workspace = true
 serde.workspace = true

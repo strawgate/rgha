@@ -200,7 +200,12 @@ impl ClassScaler {
         let tx = self.events_tx.clone();
         tokio::spawn(async move {
             let (code, timed_out) = match tokio::time::timeout(spec.timeout, backend.wait(&instance_id)).await {
-                Ok(Ok(code)) => (code, false),
+                Ok(Ok(code)) => {
+                    // Some backends (Daytona) keep the sandbox alive after the
+                    // runner exits; stop is idempotent everywhere.
+                    let _ = backend.stop(&instance_id).await;
+                    (code, false)
+                }
                 Ok(Err(e)) => {
                     tracing::debug!(%instance_id, error = %e, "wait failed; stopping");
                     let _ = backend.stop(&instance_id).await;

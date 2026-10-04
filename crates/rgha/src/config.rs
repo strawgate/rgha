@@ -78,6 +78,36 @@ pub enum BackendConfig {
         allow_insecure_runc: bool,
         pricing: Option<Pricing>,
     },
+    /// Daytona sandboxes (REST API). `container` class unless `snapshot`
+    /// names a VM-class (`linux-vm`) snapshot.
+    Daytona {
+        #[serde(default = "default_daytona_url")]
+        api_url: String,
+        #[serde(default = "default_daytona_key_env")]
+        api_key_env: String,
+        /// File containing the API key (used if the env var is unset).
+        api_key_file: Option<String>,
+        #[serde(default = "default_runner_image")]
+        image: String,
+        snapshot: Option<String>,
+        target: Option<String>,
+        #[serde(default = "default_disk_gib")]
+        disk_gib: u32,
+        /// Must be set to run an untrusted class without a VM-class snapshot.
+        #[serde(default)]
+        allow_container_class: bool,
+        pricing: Option<Pricing>,
+    },
+}
+
+fn default_daytona_url() -> String {
+    "https://app.daytona.io/api".into()
+}
+fn default_daytona_key_env() -> String {
+    "DAYTONA_API_KEY".into()
+}
+fn default_disk_gib() -> u32 {
+    5
 }
 
 fn default_modal_app() -> String {
@@ -95,6 +125,7 @@ impl BackendConfig {
         match self {
             BackendConfig::Modal { pricing, .. } => pricing.unwrap_or(Pricing::MODAL_SANDBOX),
             BackendConfig::Docker { pricing, .. } => pricing.unwrap_or(Pricing::FREE),
+            BackendConfig::Daytona { pricing, .. } => pricing.unwrap_or(Pricing::DAYTONA),
         }
     }
 }
@@ -241,6 +272,18 @@ impl Config {
             }
             if c.network == NetworkMode::Allowlist && c.allow_domains.is_empty() && c.allow_cidrs.is_empty() {
                 bail!("class {:?}: network = \"allowlist\" needs allow_domains or allow_cidrs", c.name);
+            }
+            if let BackendConfig::Daytona { snapshot, allow_container_class, .. } = backend
+                && c.policy.trust == crate::policy::Trust::Untrusted
+                && snapshot.is_none()
+                && !allow_container_class
+            {
+                bail!(
+                    "class {:?} is untrusted but backend {:?} uses Daytona's container class. Point `snapshot` \
+                     at a linux-vm snapshot, or set allow_container_class = true",
+                    c.name,
+                    c.backend
+                );
             }
             if let BackendConfig::Docker { runtime, allow_insecure_runc, .. } = backend {
                 let isolated = runtime.as_deref().is_some_and(|r| r != "runc");

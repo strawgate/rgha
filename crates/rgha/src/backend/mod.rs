@@ -1,6 +1,7 @@
 //! Sandbox backends. A backend starts one isolated environment per runner,
 //! running the official `actions/runner` with a single-use JIT config.
 
+mod daytona;
 mod docker;
 mod modal;
 
@@ -11,6 +12,7 @@ use async_trait::async_trait;
 
 use crate::config::{BackendConfig, ClassConfig, GITHUB_RUNNER_DOMAINS, NetworkMode};
 
+pub use daytona::DaytonaBackend;
 pub use docker::DockerBackend;
 pub use modal::ModalBackend;
 
@@ -91,6 +93,23 @@ pub trait Backend: Send + Sync {
     async fn list(&self, class: &str) -> anyhow::Result<Vec<Instance>>;
 }
 
+/// Accepts a bare key or a `NAME=value` line (dotenv style); the last
+/// non-empty line wins.
+fn parse_key_file(text: &str) -> Option<String> {
+    let line = text.lines().map(str::trim).rfind(|l| !l.is_empty() && !l.starts_with('#'))?;
+    let value = line.strip_prefix("export ").unwrap_or(line);
+    let value = value.split_once('=').map(|(_, v)| v).unwrap_or(value);
+    let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn expand_home(path: &str) -> String {
+    match (path.strip_prefix("~/"), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) => format!("{home}/{rest}"),
+        _ => path.to_string(),
+    }
+}
+
 pub async fn build(name: &str, cfg: &BackendConfig) -> anyhow::Result<Arc<dyn Backend>> {
     let backend: Arc<dyn Backend> = match cfg {
         BackendConfig::Modal { app, image, image_commands, profile, runtime, regions, .. } => Arc::new(
@@ -106,7 +125,35 @@ pub async fn build(name: &str, cfg: &BackendConfig) -> anyhow::Result<Arc<dyn Ba
             .await?,
         ),
         BackendConfig::Docker { image, runtime, bin, .. } => Arc::new(DockerBackend::new(bin, image, runtime.clone())),
+        BackendConfig::Daytona { api_url, api_key_env, api_key_file, image, snapshot, target, disk_gib, .. } => {
+            let key = match std::env::var(api_key_env) {
+                Ok(k) if !k.trim().is_empty() => k.trim().to_string(),
+                _ => match api_key_file {
+                    Some(path) => {
+                        let path = expand_home(path);
+                        let text = std::fs::read_to_string(&path)
+                            .map_err(|e| anyhow::anyhow!("reading Daytona API key file {path}: {e}"))?;
+                        parse_key_file(&text).ok_or_else(|| anyhow::anyhow!("Daytona API key file {path} is empty"))?
+                    }
+                    None => anyhow::bail!("Daytona backend {name}: set {api_key_env} or api_key_file"),
+                },
+            };
+            Arc::new(DaytonaBackend::new(api_url, key, image, snapshot.clone(), target.clone(), *disk_gib)?)
+        }
     };
     backend.prepare().await?;
     Ok(backend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_file_formats() {
+        assert_eq!(parse_key_file("dtn_abc\n").as_deref(), Some("dtn_abc"));
+        assert_eq!(parse_key_file("DAYTONA_API_KEY=dtn_abc").as_deref(), Some("dtn_abc"));
+        assert_eq!(parse_key_file("# c\nexport DAYTONA_API_KEY=\"dtn_abc\"\n\n").as_deref(), Some("dtn_abc"));
+        assert_eq!(parse_key_file("\n  \n"), None);
+    }
 }

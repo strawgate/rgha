@@ -16,6 +16,11 @@ app = "rgha"
 image = "ghcr.io/actions/actions-runner:latest"
 # runtime = "vm"   # Modal's alpha VM runtime: real kernel, Docker-in-job
 
+[backends.daytona]
+type = "daytona"
+api_key_file = "~/.config/rgha/daytona"   # or DAYTONA_API_KEY; bare key or NAME=value
+# snapshot = "rgha-runner-vm"             # a linux-vm snapshot for VM isolation
+
 [backends.local]
 type = "docker"
 runtime = "runsc"  # gVisor; or a Kata runtime. Plain runc is refused for untrusted classes.

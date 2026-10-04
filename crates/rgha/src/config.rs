@@ -62,6 +62,9 @@ pub enum BackendConfig {
         runtime: Option<String>,
         #[serde(default)]
         regions: Vec<String>,
+        /// Start dockerd in each sandbox so jobs can use Docker. Requires runtime = "vm".
+        #[serde(default)]
+        docker: bool,
         pricing: Option<Pricing>,
     },
     /// Local containers via the docker CLI. Plain `runc` shares the host
@@ -298,6 +301,13 @@ impl Config {
                 if c.network != NetworkMode::Open {
                     bail!("class {:?}: network restrictions are not implemented for the docker backend yet", c.name);
                 }
+            }
+        }
+        for (name, b) in &self.backends {
+            if let BackendConfig::Modal { docker: true, runtime, .. } = b
+                && runtime.as_deref() != Some("vm")
+            {
+                bail!("backend {name:?}: docker = true requires runtime = \"vm\" (gVisor cannot run dockerd)");
             }
         }
         if self.github.app_client_id.is_some() != self.github.app_installation_id.is_some() {

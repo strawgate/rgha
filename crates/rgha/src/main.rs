@@ -131,6 +131,25 @@ async fn build_backends(cfg: &Config) -> anyhow::Result<HashMap<String, Arc<dyn 
     Ok(out)
 }
 
+/// Resolves on SIGINT (Ctrl-C) or SIGTERM (`docker stop`, Kubernetes,
+/// systemd), returning which one arrived.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = term.recv() => "SIGTERM",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl-C"
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -216,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
+                sig = shutdown_signal() => tracing::info!(signal = sig, "shutting down"),
                 Some(res) = tasks.join_next() => {
                     // A class failed hard (e.g. scale set creation). Stop the rest.
                     tracing::error!("class controller exited: {:?}", res);

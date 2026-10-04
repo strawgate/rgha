@@ -88,7 +88,7 @@ impl ClassController {
             }
         }
         scaler.shutdown().await;
-        if let Some(r) = scaler.ledger.savings_ratio() {
+        if let Some(r) = scaler.ledger.savings_ratio().filter(|_| scaler.ledger.jobs > 0) {
             tracing::info!(class = %self.class.name, jobs = scaler.ledger.jobs, cost_usd = scaler.ledger.sandbox_usd,
                 github_equiv_usd = scaler.ledger.github_usd, "session savings: {r:.1}x cheaper than GitHub-hosted");
         }

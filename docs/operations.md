@@ -29,15 +29,15 @@ The image defaults to `RGHA_CONFIG=/etc/rgha/rgha.toml` and
 ExecStart=/usr/local/bin/rgha run --config /etc/rgha/rgha.toml --metrics-addr 127.0.0.1:9464 --log-json
 EnvironmentFile=/etc/rgha/env        # MODAL_TOKEN_ID, MODAL_TOKEN_SECRET, ...
 Restart=always
-KillSignal=SIGINT                    # graceful: idle runners deregistered, busy ones finish
-TimeoutStopSec=60
+TimeoutStopSec=60                    # SIGTERM is graceful: idle runners deregistered, busy ones finish
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-On SIGINT, rgha deregisters and stops idle runners and leaves busy ones to
-finish; each sandbox's lifetime is capped. On startup, and every 5 minutes,
+On SIGTERM or SIGINT, rgha deregisters and stops idle runners, closes its
+message sessions, and leaves busy ones to finish; each sandbox's lifetime is
+capped. Give it ~30–60 s to stop (`docker stop -t 60`, `terminationGracePeriodSeconds`). On startup, and every 5 minutes,
 it stops instances it doesn't track, such as those left by a crash, unless
 their runner is mid-job.
 

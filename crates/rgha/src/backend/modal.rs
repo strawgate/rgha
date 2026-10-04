@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use rgha_modal::{Client, Profile, SandboxSpec};
 use tokio::sync::OnceCell;
 
-use super::{Backend, Instance, JIT_ENV, Network, RUNNER_ENTRYPOINT, RunnerSpec};
+use super::{Backend, Instance, JIT_ENV, Network, RUNNER_ENTRYPOINT, RunnerSpec, Usage};
 
 const TAG_OWNER: &str = "rgha";
 const TAG_CLASS: &str = "rgha-class";
@@ -153,6 +153,11 @@ impl Backend for ModalBackend {
 
     async fn stop(&self, id: &str) -> anyhow::Result<()> {
         Ok(self.client.sandbox_terminate(id).await?)
+    }
+
+    async fn usage(&self, id: &str) -> anyhow::Result<Option<Usage>> {
+        let u = self.client.sandbox_resource_usage(id).await?;
+        Ok(Some(Usage { cpu_core_secs: u.cpu_core_secs, mem_gib_secs: u.mem_gib_secs }))
     }
 
     async fn wait(&self, id: &str) -> anyhow::Result<Option<i32>> {

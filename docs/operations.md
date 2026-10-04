@@ -94,6 +94,32 @@ and jobs can still burst.
 `rgha estimate --seconds N --cpu C --memory-mib M` compares a job's cost with
 a per-minute GitHub-hosted runner.
 
+### Where the money goes (metered)
+
+After each sandbox ends, rgha reads Modal's usage meter. Modal reports billed
+quantities: the higher of request and use, from container start to stop. rgha
+logs `runner metered` with core-seconds, GiB-seconds and USD, next to the
+estimate. Measured on the testbed (2026-10-04, `cpu = 0.125`, `memory_mib = 128`):
+
+| What | Metered cost |
+|---|---|
+| ~10 s shell job (checkout + echo) | ~$0.00009, ~2 core-s; CPU is ~90% of it |
+| Node/Python test job | ~$0.0002–0.00027 |
+| Docker build job (VM runtime) | ~$0.00016 |
+| Idle warm runner | ~$0.021/hour (0.125 core + 128 MiB floor), ≈ 4 short jobs per minute |
+
+Levers, biggest first:
+
+- **Warm runners that never get a job dominate spend for light, bursty use.**
+  In one round, 3 unused warm runners cost 40% of the total. Use `min_idle = 0`
+  with a small `warm_max`, or a short `warm_shrink_secs`, unless queue time
+  matters more than about $0.0004 per idle minute.
+- **Request floors:** `cpu = 0.125` is Modal's minimum. `memory_mib = 128` is
+  enough for the runner because it bursts to `memory_limit_mib`. Going from 256
+  to 128 MiB halves memory cost, which is only ~5% of a job.
+- **Runner overhead:** the runner's own startup is about 1 core-second per
+  job. Tuning it would save around $0.00001 per job.
+
 ### Preloading the image
 
 `[backends.<name>.preload]` bakes actions into the runner's action cache, and
@@ -153,7 +179,8 @@ Enabled with `--metrics-addr` / `RGHA_METRICS_ADDR`. All metrics are labelled `c
 | `rgha_runner_start_failures_total` | counter | failed starts (retried, then backed off ≤ 60 s) |
 | `rgha_policy_rejections_total` | counter | jobs rejected by class policy (runs cancelled) |
 | `rgha_orphans_stopped_total` | counter | untracked instances stopped by reconciliation |
-| `rgha_cost_usd_total` | gauge | estimated spend: busy time at `cpu_limit`, idle time at `cpu` |
+| `rgha_metered_cost_usd_total` | gauge | real spend from Modal's usage meter, read ~10 s after each sandbox ends |
+| `rgha_cost_usd_total` | gauge | pessimistic estimate: busy time at `cpu_limit`, idle time at `cpu` (5–8× above metered in practice) |
 | `rgha_github_equivalent_usd_total` | gauge | the same jobs at per-minute GitHub-hosted prices |
 | `rgha_runners{state}` | gauge | idle / busy runners |
 | `rgha_assigned_jobs` | gauge | jobs assigned to the scale set, minus blocked ones |

@@ -39,7 +39,7 @@ name = "rgha-tiny"
 backend = "modal"
 cpu = 0.125              # Modal physical cores (1 core = 2 vCPU), the billed floor
 cpu_limit = 2.0          # burst cap: ~3x faster runner boot; billed by actual usage
-memory_mib = 256         # billed floor while idle...
+memory_mib = 128         # billed floor while idle...
 memory_limit_mib = 2048  # ...jobs can use up to this (billed on usage)
 max_runners = 20
 min_idle = 0             # floor: scale to zero when quiet

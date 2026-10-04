@@ -35,13 +35,13 @@ sets high limits:
 ```toml
 cpu = 0.125              # billed floor (Modal physical cores; 1 core = 2 vCPU)
 cpu_limit = 2.0          # jobs can burst to 2 cores; you pay for what they use
-memory_mib = 256
+memory_mib = 128
 memory_limit_mib = 4096
 ```
 
-An idle warm runner costs about **$0.024/hour**. A 20-second lint job costs
-about **$0.0004**, against $0.006 for a full minute on a GitHub-hosted 2-core
-runner.
+Measured with Modal's own usage meter, a ~10-second job costs about
+**$0.0001**, against $0.006 for a full minute on a GitHub-hosted 2-core
+runner. An idle warm runner costs about **$0.021/hour**.
 
 | Platform | CPU billed on | Memory billed on | Granularity |
 |---|---|---|---|
@@ -57,8 +57,12 @@ side (shell, Node, Python, Docker, a 10-job burst;
 | | Queue p50 | Job duration | Cost for 42 jobs |
 |---|---|---|---|
 | GitHub-hosted (private-repo price) | 3–5 s | baseline | $0.252 |
-| rgha on Modal, scale to zero | 7–8 s | same; Docker builds ~2× faster | **$0.040** (~6× less) |
-| rgha on Modal, adaptive warm pool | 3–7.5 s | same; Docker builds ~2× faster | **$0.061**, incl. idle warm time (~4× less) |
+| rgha on Modal, scale to zero | 7–8 s | same; Docker builds ~2× faster | **~$0.005** metered (~50× less) |
+| rgha on Modal, adaptive warm pool | 3–7.5 s | same; Docker builds ~2× faster | **$0.0085** metered, plus idle warm time (~30× less) |
+
+Costs are from Modal's usage meter (`rgha_metered_cost_usd_total`). The
+controller's built-in estimate prices busy time at the limits, so it reads 5–8×
+higher. [Where the money goes](docs/operations.md#where-the-money-goes-metered).
 
 - **Warm pickups take 0.1 s.** The adaptive warm pool grows by one runner while
   jobs start cold and shrinks by one after quiet periods.
@@ -72,7 +76,7 @@ side (shell, Node, Python, Docker, a 10-job burst;
 - **Hardware differs.** Public-repo `ubuntu-latest` is 4 vCPU / 16 GB; these
   rgha classes request 0.125–1 core and burst to 2.
 
-Every finished job logs its sandbox cost next to the GitHub-hosted
+Every finished job logs its metered sandbox cost next to the GitHub-hosted
 equivalent, and `/metrics` exports both.
 
 ## Safe on public repos

@@ -113,6 +113,21 @@ impl Network {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ResourceUsage {
+    pub cpu_core_secs: f64,
+    pub mem_gib_secs: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BillingItem {
+    pub object_id: String,
+    pub description: String,
+    pub cost_usd: f64,
+    pub cost_by_resource: HashMap<String, f64>,
+    pub tags: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SandboxSummary {
     pub id: String,
@@ -410,6 +425,54 @@ impl Client {
             .sandbox_id;
         self.sandbox_wait_running(&sandbox_id, Duration::from_secs(55)).await?;
         Ok(sandbox_id)
+    }
+
+    /// Actual resource usage of a Sandbox so far (CPU core-seconds and
+    /// memory GiB-seconds), as metered by Modal.
+    pub async fn sandbox_resource_usage(&self, sandbox_id: &str) -> Result<ResourceUsage> {
+        let r = self
+            .rpc()
+            .await?
+            .sandbox_get_resource_usage(pb::SandboxGetResourceUsageRequest { sandbox_id: sandbox_id.to_string() })
+            .await?
+            .into_inner();
+        Ok(ResourceUsage {
+            cpu_core_secs: r.cpu_core_nanosecs as f64 / 1e9,
+            mem_gib_secs: r.mem_gib_nanosecs as f64 / 1e9,
+        })
+    }
+
+    /// Billed cost per object (e.g. Sandbox) for `app_id` between two Unix
+    /// times, at hourly resolution, as reported by Modal's billing system.
+    pub async fn billing_report(&self, app_id: &str, start_unix: i64, end_unix: i64) -> Result<Vec<BillingItem>> {
+        let ts = |s: i64| prost_types::Timestamp { seconds: s, nanos: 0 };
+        let mut stream = self
+            .rpc()
+            .await?
+            .workspace_billing_report(pb::WorkspaceBillingReportRequest {
+                start_timestamp: Some(ts(start_unix)),
+                end_timestamp: Some(ts(end_unix)),
+                resolution: "h".into(),
+                app_ids: vec![app_id.to_string()],
+                ..Default::default()
+            })
+            .await?
+            .into_inner();
+        let mut out = Vec::new();
+        while let Some(item) = stream.message().await? {
+            out.push(BillingItem {
+                object_id: item.object_id,
+                description: item.description,
+                cost_usd: item.cost.parse().unwrap_or(0.0),
+                cost_by_resource: item
+                    .cost_by_resource
+                    .into_iter()
+                    .map(|(k, v)| (k, v.parse().unwrap_or(0.0)))
+                    .collect(),
+                tags: item.tags.into_iter().collect(),
+            });
+        }
+        Ok(out)
     }
 
     pub async fn sandbox_terminate(&self, sandbox_id: &str) -> Result<()> {

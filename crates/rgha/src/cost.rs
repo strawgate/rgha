@@ -24,6 +24,11 @@ impl Pricing {
     /// checked 2026-10). Daytona allocates whole vCPUs and GiB.
     pub const DAYTONA: Pricing = Pricing { cpu_per_sec: 0.000_014, gib_per_sec: 0.000_004_5, min_billed_secs: 0.0 };
 
+    /// Cost of metered core-seconds and GiB-seconds.
+    pub fn metered(&self, cpu_core_secs: f64, mem_gib_secs: f64) -> f64 {
+        cpu_core_secs * self.cpu_per_sec + mem_gib_secs * self.gib_per_sec
+    }
+
     pub fn cost(&self, cpu: f64, memory_mib: u32, secs: f64) -> f64 {
         let billed = secs.max(self.min_billed_secs).max(0.0);
         billed * (cpu * self.cpu_per_sec + (memory_mib as f64 / 1024.0) * self.gib_per_sec)

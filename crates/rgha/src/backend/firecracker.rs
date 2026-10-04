@@ -52,13 +52,17 @@ const GUEST_MAC: &str = "06:00:ac:1e:00:02";
 
 /// Docker-in-job: the runner image ships static dockerd/containerd/runc; the
 /// guest kernel has legacy iptables (no nf_tables), so switch alternatives.
-/// dockerd is started by the pre-config hook, i.e. before the snapshot.
+/// The CI kernel also lacks the iptables `raw` table that Docker 28+ uses for
+/// "direct access filtering" (protecting published ports from other hosts on
+/// a shared LAN), which doesn't apply inside a single-tenant microVM; Docker's
+/// `DOCKER_INSECURE_NO_IPTABLES_RAW` skips it. dockerd is started by the
+/// pre-config hook, i.e. before the snapshot.
 const DOCKER_LAYERS: &[&str] = &[
     "RUN apt-get update && apt-get install -y --no-install-recommends iptables && rm -rf /var/lib/apt/lists/* \\
      && update-alternatives --set iptables /usr/sbin/iptables-legacy \\
      && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy",
     "RUN mkdir -p /etc/rgha && printf '%s\\n' '#!/bin/bash' \\
-     'dockerd --iptables=true > /var/log/dockerd.log 2>&1 &' \\
+     'DOCKER_INSECURE_NO_IPTABLES_RAW=1 dockerd --iptables=true > /var/log/dockerd.log 2>&1 &' \\
      'for i in $(seq 1 150); do docker info > /dev/null 2>&1 && break; sleep 0.1; done' \\
      'if docker info > /dev/null 2>&1; then echo \"rgha-init: dockerd ready\"; else echo \"rgha-init: dockerd failed\"; tail -20 /var/log/dockerd.log; fi' \\
      > /etc/rgha/pre-config && chmod 0755 /etc/rgha/pre-config",

@@ -55,6 +55,15 @@ last job.
 The same job on **Daytona** (1 vCPU / 1 GiB, cached image): runner online
 3.7 s after assignment, job 5.5 s, sandbox billed for 7.7 s, about $0.00014.
 
+**Side by side with GitHub-hosted `ubuntu-latest`** (42 jobs per side:
+shell, Node, Python, Docker, 10-job burst; [full results](https://github.com/strawgate/rgha-testbed#github-hosted-vs-rgha-2026-10-04-rgha-main-after-v011)):
+
+| | Queue p50 | Job duration | Cost for 42 jobs |
+|---|---|---|---|
+| GitHub-hosted (private-repo price) | 3–5 s | baseline | $0.252 |
+| rgha, scale to zero | 7–8 s | same; Docker builds ~2× faster | **$0.040** (~6× less) |
+| rgha, warm pools sized to the burst | 3–4 s | same; Docker builds ~2× faster | $0.174 incl. a 10-min idle tail of 14 warm runners |
+
 The advantage shrinks for long, bigger jobs: a 3-minute job at 1 Modal core
 (2 vCPU) / 4 GiB is only ~1.4× cheaper than a 2-core hosted runner. Standard GitHub-hosted runners are **free for public repos**, so
 the cost win applies to private repos, to larger runners, and to anyone who

@@ -157,10 +157,8 @@ impl ClassScaler {
     /// which is coarse because start/complete often arrive in one batch.
     fn record(&mut self, d: &Departed, why: &str, job_secs: Option<f64>) {
         let sandbox_secs = d.lifetime.as_secs_f64();
-        // Priced at the CPU limit: an upper bound when bursting above the request.
-        let cpu = self.class.cpu_limit.unwrap_or(self.class.cpu);
-        let usd = self.pricing.cost(cpu, self.class.memory_mib, sandbox_secs);
         let job_secs = job_secs.or(d.job.map(|j| j.as_secs_f64()));
+        let usd = sandbox_cost(&self.pricing, &self.class, sandbox_secs, job_secs);
         let github_usd = job_secs.map(|j| github_hosted_cost(j, self.class.github_equivalent_per_min)).unwrap_or(0.0);
         self.ledger.record(sandbox_secs, job_secs, usd, self.class.github_equivalent_per_min);
         metrics::job_finished(&self.class.name, why, job_secs, sandbox_secs, usd, github_usd);
@@ -387,6 +385,15 @@ impl rgha_scaleset::Scaler for ClassScaler {
     }
 }
 
+/// Busy time is priced at the CPU cap (an upper bound for bursting jobs);
+/// idle/boot time at the request, which is what Modal bills when the
+/// sandbox is mostly waiting.
+fn sandbox_cost(pricing: &Pricing, class: &ClassConfig, sandbox_secs: f64, job_secs: Option<f64>) -> f64 {
+    let busy = job_secs.unwrap_or(0.0).clamp(0.0, sandbox_secs);
+    let cap = class.cpu_limit.unwrap_or(class.cpu);
+    pricing.cost(cap, class.memory_mib, busy) + pricing.cost(class.cpu, class.memory_mib, sandbox_secs - busy)
+}
+
 /// The service sends `0001-01-01T00:00:00Z` for unset timestamps.
 fn real(t: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
     t.filter(|t| t.year() >= 2000)
@@ -472,6 +479,19 @@ mod tests {
         assert_eq!(secs_between(ts("2026-10-04T02:28:08.055Z"), ts("2026-10-04T02:28:13.452Z")), Some(5.397));
         assert_eq!(secs_between(ts("2026-10-04T02:28:13Z"), ts("2026-10-04T02:28:08Z")), None);
         assert_eq!(secs_between(None, ts("2026-10-04T02:28:08Z")), None);
+    }
+
+    #[test]
+    fn idle_time_priced_at_request_busy_at_cap() {
+        let mut class: ClassConfig =
+            toml::from_str("name = \"c\"\nbackend = \"b\"\ncpu = 0.25\ncpu_limit = 2.0\nmemory_mib = 1024").unwrap();
+        let p = Pricing { cpu_per_sec: 1.0, gib_per_sec: 0.0, min_billed_secs: 0.0 };
+        // 30s sandbox, 10s busy: 10*2.0 + 20*0.25
+        assert!((sandbox_cost(&p, &class, 30.0, Some(10.0)) - 25.0).abs() < 1e-9);
+        // job longer than sandbox lifetime (clock skew) is clamped
+        assert!((sandbox_cost(&p, &class, 5.0, Some(9.0)) - 10.0).abs() < 1e-9);
+        class.cpu_limit = None;
+        assert!((sandbox_cost(&p, &class, 30.0, Some(10.0)) - 7.5).abs() < 1e-9);
     }
 
     #[test]

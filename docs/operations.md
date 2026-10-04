@@ -222,11 +222,24 @@ identical internal tap and guest address, which snapshot restore requires.
 That is NATed onto a unique veth /30 and then out of the uplink. Rules live in dedicated `RGHA-FWD` / `RGHA-NAT` chains;
 `RGHA-FWD` is inserted into `DOCKER-USER` when Docker is present. Guests
 cannot reach the host, RFC1918 ranges (your other VMs, Docker networks, LAN),
-CGNAT, or link-local/metadata addresses. Egress allowlists
-(`network = "github-only"`) are tracked in strawgate/rgha#22. To remove the
+CGNAT, or link-local/metadata addresses.
+
+**Egress allowlists** (`network = "github-only"` or `"allowlist"`) are
+enforced on the host. A locked-down VM's TCP 443 and 80 are redirected to a
+transparent proxy in rgha (ports 15443/15080). The proxy reads the TLS SNI or
+the HTTP `Host` header, checks it against the class allowlist (`*.x` matches
+subdomains), and connects upstream **by name**. Pairing an allowed name with
+another IP doesn't help, and names that resolve to private or link-local
+addresses are refused. Connections without an SNI (e.g. ECH) are dropped.
+Everything else from the VM is dropped except DNS to `dns` and any
+`allow_cidrs`. Verified on the testbed: GitHub worked, while `example.com`
+(HTTPS and HTTP), a spoofed resolve, a direct IP and `pypi.org` were blocked.
+DNS itself stays open to the configured resolver, which allows DNS-based
+exfiltration. To remove the
 rules:
 `iptables -D DOCKER-USER -j RGHA-FWD; iptables -D INPUT -i rgha+ -j DROP;
-iptables -t nat -D POSTROUTING -j RGHA-NAT`.
+iptables -D INPUT -i rgha+ -p tcp -m multiport --dports 15443,15080 -j ACCEPT;
+iptables -t nat -D POSTROUTING -j RGHA-NAT; iptables -t nat -D PREROUTING -j RGHA-PRE`.
 
 **Measured** (on a host loaded at 40–74 on 72 cores, so timings are pessimistic):
 

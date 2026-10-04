@@ -23,29 +23,51 @@ pub struct ModalBackend {
     image_commands: Vec<String>,
     runtime: Option<String>,
     regions: Vec<String>,
+    docker: bool,
     ids: OnceCell<(String, String)>,
 }
 
+/// Settings for [`ModalBackend::connect`], mirroring `BackendConfig::Modal`.
+pub struct ModalSettings<'a> {
+    pub app: &'a str,
+    pub image: &'a str,
+    pub image_commands: &'a [String],
+    pub profile: Option<&'a str>,
+    pub runtime: Option<String>,
+    pub regions: Vec<String>,
+    pub docker: bool,
+}
+
+/// Layered on the runner image when `docker = true`. The official image
+/// already ships static dockerd/containerd/runc; bridge networking needs iptables.
+pub(crate) const DOCKER_IMAGE_COMMANDS: &[&str] = &[
+    "USER root",
+    "RUN apt-get update && apt-get install -y --no-install-recommends iptables && rm -rf /var/lib/apt/lists/*",
+];
+
+/// Starts dockerd, waits up to ~30s for it, then hands over to the runner.
+pub(crate) const DOCKER_ENTRYPOINT: &str = "dockerd >/tmp/dockerd.log 2>&1 & \
+for i in $(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 0.5; done; \
+docker info >/dev/null 2>&1 || { echo 'dockerd failed to start' >&2; tail -50 /tmp/dockerd.log >&2; }; \
+exec /home/runner/run.sh";
+
 impl ModalBackend {
-    pub async fn connect(
-        name: &str,
-        app: &str,
-        image: &str,
-        image_commands: &[String],
-        profile: Option<&str>,
-        runtime: Option<String>,
-        regions: Vec<String>,
-    ) -> anyhow::Result<Self> {
-        let profile = Profile::load(profile).context("loading Modal credentials")?;
+    pub async fn connect(name: &str, s: ModalSettings<'_>) -> anyhow::Result<Self> {
+        let profile = Profile::load(s.profile).context("loading Modal credentials")?;
         let client = Client::connect(profile).await.context("connecting to Modal")?;
+        let mut image_commands = s.image_commands.to_vec();
+        if s.docker {
+            image_commands.extend(DOCKER_IMAGE_COMMANDS.iter().map(|c| c.to_string()));
+        }
         Ok(Self {
             name: name.to_string(),
             client,
-            app_name: app.to_string(),
-            image: image.to_string(),
-            image_commands: image_commands.to_vec(),
-            runtime,
-            regions,
+            app_name: s.app.to_string(),
+            image: s.image.to_string(),
+            image_commands,
+            runtime: s.runtime,
+            regions: s.regions,
+            docker: s.docker,
             ids: OnceCell::new(),
         })
     }
@@ -68,6 +90,7 @@ pub(crate) fn sandbox_spec(
     image_id: &str,
     runtime: Option<String>,
     regions: Vec<String>,
+    docker: bool,
 ) -> SandboxSpec {
     let network = match &spec.network {
         Network::Open => rgha_modal::Network::Open,
@@ -78,7 +101,11 @@ pub(crate) fn sandbox_spec(
     SandboxSpec {
         name: spec.name.clone(),
         image_id: image_id.to_string(),
-        command: vec![RUNNER_ENTRYPOINT.to_string()],
+        command: if docker {
+            vec!["/bin/bash".into(), "-c".into(), DOCKER_ENTRYPOINT.into()]
+        } else {
+            vec![RUNNER_ENTRYPOINT.to_string()]
+        },
         workdir: Some("/home/runner".into()),
         // The JIT config travels in an ephemeral Secret, not in the Sandbox
         // definition. It is single-use and bound to this one runner.
@@ -115,7 +142,7 @@ impl Backend for ModalBackend {
 
     async fn start(&self, spec: &RunnerSpec) -> anyhow::Result<String> {
         let (app_id, image_id) = self.ids().await?;
-        let sb = sandbox_spec(spec, image_id, self.runtime.clone(), self.regions.clone());
+        let sb = sandbox_spec(spec, image_id, self.runtime.clone(), self.regions.clone(), self.docker);
         Ok(self.client.sandbox_create(app_id, &sb).await?)
     }
 
@@ -161,7 +188,10 @@ mod tests {
             timeout: Duration::from_secs(600),
             network: Network::Allowlist { domains: vec!["github.com".into()], cidrs: vec![] },
         };
-        let sb = sandbox_spec(&spec, "im-1", None, vec![]);
+        let sb = sandbox_spec(&spec, "im-1", None, vec![], false);
+        assert_eq!(sb.command, vec![RUNNER_ENTRYPOINT.to_string()]);
+        let docker = sandbox_spec(&spec, "im-1", Some("vm".into()), vec![], true);
+        assert!(docker.command[2].contains("dockerd") && docker.command[2].ends_with("exec /home/runner/run.sh"));
         assert_eq!(sb.secret_env.get(JIT_ENV).map(String::as_str), Some("SECRET"));
         assert!(!sb.command.iter().any(|a| a.contains("SECRET")));
         assert!(!sb.tags.values().any(|v| v.contains("SECRET")));

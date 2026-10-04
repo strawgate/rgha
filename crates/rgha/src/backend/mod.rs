@@ -14,7 +14,7 @@ use crate::config::{BackendConfig, ClassConfig, GITHUB_RUNNER_DOMAINS, NetworkMo
 
 pub use daytona::DaytonaBackend;
 pub use docker::DockerBackend;
-pub use modal::ModalBackend;
+pub use modal::{ModalBackend, ModalSettings};
 
 /// Env var the official runner image reads its JIT config from.
 pub const JIT_ENV: &str = "ACTIONS_RUNNER_INPUT_JITCONFIG";
@@ -112,15 +112,18 @@ fn expand_home(path: &str) -> String {
 
 pub async fn build(name: &str, cfg: &BackendConfig) -> anyhow::Result<Arc<dyn Backend>> {
     let backend: Arc<dyn Backend> = match cfg {
-        BackendConfig::Modal { app, image, image_commands, profile, runtime, regions, .. } => Arc::new(
+        BackendConfig::Modal { app, image, image_commands, profile, runtime, regions, docker, .. } => Arc::new(
             ModalBackend::connect(
                 name,
-                app,
-                image,
-                image_commands,
-                profile.as_deref(),
-                runtime.clone(),
-                regions.clone(),
+                ModalSettings {
+                    app,
+                    image,
+                    image_commands,
+                    profile: profile.as_deref(),
+                    runtime: runtime.clone(),
+                    regions: regions.clone(),
+                    docker: *docker,
+                },
             )
             .await?,
         ),

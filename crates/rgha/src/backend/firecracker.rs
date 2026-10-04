@@ -38,6 +38,7 @@ use tokio::process::Command;
 use tokio::sync::{OnceCell, watch};
 
 use super::{Backend, Instance, Network, RunnerSpec};
+use crate::egress::{EgressProxy, HTTP_PORT, TLS_PORT};
 use crate::image::Preload;
 
 pub const GUEST_INIT: &str = include_str!("../../assets/firecracker/rgha-init");
@@ -84,6 +85,9 @@ struct Meta {
     slot: u32,
     pid: u32,
     jailed: bool,
+    /// Egress allowlist (domains, CIDRs) when the class restricts network.
+    #[serde(default)]
+    allow: Option<(Vec<String>, Vec<String>)>,
 }
 
 struct Vm {
@@ -108,9 +112,33 @@ struct Inner {
     templates: tokio::sync::Mutex<HashMap<(u32, u32), Option<Template>>>,
     vms: Mutex<HashMap<String, Vm>>,
     slots: Mutex<BTreeSet<u32>>,
+    egress: EgressProxy,
+    egress_started: OnceCell<()>,
 }
 
 // ------------------------------------------------------------- pure helpers
+
+/// iptables rules (table, chain, args) that lock a slot's VM down to: TCP
+/// 443/80 via the egress proxy, DNS to `dns`, and `cidrs`. Applied with `-I`
+/// (so they precede the general rules) and removed with `-D`.
+pub(crate) fn egress_rules(slot: u32, dns: &str, cidrs: &[String]) -> Vec<(&'static str, &'static str, Vec<String>)> {
+    let veth = veth_name(slot);
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let (tls, http) = (TLS_PORT.to_string(), HTTP_PORT.to_string());
+    let mut rules = vec![
+        ("nat", "RGHA-PRE", s(&["-i", &veth, "-p", "tcp", "--dport", "443", "-j", "REDIRECT", "--to-ports", &tls])),
+        ("nat", "RGHA-PRE", s(&["-i", &veth, "-p", "tcp", "--dport", "80", "-j", "REDIRECT", "--to-ports", &http])),
+        // Inserted in this order with -I, so the final DROP ends up last.
+        ("filter", "RGHA-FWD", s(&["-i", &veth, "-j", "DROP"])),
+    ];
+    for c in cidrs {
+        rules.push(("filter", "RGHA-FWD", s(&["-i", &veth, "-d", c, "-j", "ACCEPT"])));
+    }
+    for proto in ["udp", "tcp"] {
+        rules.push(("filter", "RGHA-FWD", s(&["-i", &veth, "-p", proto, "-d", dns, "--dport", "53", "-j", "ACCEPT"])));
+    }
+    rules
+}
 
 /// Host and namespace ends of a slot's veth /30.
 pub(crate) fn slot_addrs(subnet: [u8; 2], slot: u32) -> (Ipv4Addr, Ipv4Addr) {
@@ -247,6 +275,8 @@ impl FirecrackerBackend {
             templates: tokio::sync::Mutex::new(HashMap::new()),
             vms: Mutex::new(HashMap::new()),
             slots: Mutex::new(BTreeSet::new()),
+            egress: EgressProxy::default(),
+            egress_started: OnceCell::new(),
         }))
     }
 }
@@ -341,11 +371,42 @@ impl Inner {
         if run("iptables", &["-C", hook, "-j", "RGHA-FWD"]).await.is_err() {
             run("iptables", &["-I", hook, "-j", "RGHA-FWD"]).await?;
         }
-        // Guests can't talk to the host itself.
+        // Guests can't talk to the host itself, except the egress proxy ports
+        // that locked-down VMs are redirected to (ACCEPT inserted above DROP).
         if run("iptables", &["-C", "INPUT", "-i", "rgha+", "-j", "DROP"]).await.is_err() {
             run("iptables", &["-I", "INPUT", "-i", "rgha+", "-j", "DROP"]).await?;
         }
+        let ports = format!("{TLS_PORT},{HTTP_PORT}");
+        let accept = ["INPUT", "-i", "rgha+", "-p", "tcp", "-m", "multiport", "--dports", &ports, "-j", "ACCEPT"];
+        if run("iptables", &[&["-C"][..], &accept[..]].concat()).await.is_err() {
+            run("iptables", &[&["-I"][..], &accept[..]].concat()).await?;
+        }
+        run_ok("iptables", &["-t", "nat", "-N", "RGHA-PRE"]).await;
+        if run("iptables", &["-t", "nat", "-C", "PREROUTING", "-j", "RGHA-PRE"]).await.is_err() {
+            run("iptables", &["-t", "nat", "-I", "PREROUTING", "-j", "RGHA-PRE"]).await?;
+        }
         Ok(())
+    }
+
+    /// Locks a slot down to its allowlist (rules + proxy registration).
+    async fn apply_egress(&self, slot: u32, domains: &[String], cidrs: &[String]) -> anyhow::Result<()> {
+        self.egress_started.get_or_try_init(|| self.egress.start()).await?;
+        self.egress.register(slot_addrs(self.s.subnet, slot).1, domains.to_vec());
+        for (table, chain, rule) in egress_rules(slot, &self.s.dns, cidrs) {
+            let mut args = vec!["-t", table, "-I", chain];
+            args.extend(rule.iter().map(String::as_str));
+            run("iptables", &args).await?;
+        }
+        Ok(())
+    }
+
+    async fn remove_egress(&self, slot: u32, cidrs: &[String]) {
+        self.egress.unregister(slot_addrs(self.s.subnet, slot).1);
+        for (table, chain, rule) in egress_rules(slot, &self.s.dns, cidrs) {
+            let mut args = vec!["-t", table, "-D", chain];
+            args.extend(rule.iter().map(String::as_str));
+            run_ok("iptables", &args).await;
+        }
     }
 
     /// Per-VM namespace: tap0 (identical in every VM) NATed onto a unique veth.
@@ -485,6 +546,9 @@ impl Inner {
     }
 
     async fn cleanup(&self, meta: &Meta) {
+        if let Some((_, cidrs)) = &meta.allow {
+            self.remove_egress(meta.slot, cidrs).await;
+        }
         self.teardown(&meta.id, meta.slot).await;
     }
 
@@ -519,6 +583,12 @@ impl Inner {
             let Ok(meta) = serde_json::from_str::<Meta>(&text) else { continue };
             self.slots.lock().expect("slots lock").insert(meta.slot);
             if pid_alive(meta.pid) {
+                // Firewall rules survive a controller restart; the proxy's
+                // in-memory allowlist doesn't.
+                if let Some((domains, _)) = &meta.allow {
+                    self.egress_started.get_or_try_init(|| self.egress.start()).await?;
+                    self.egress.register(slot_addrs(self.s.subnet, meta.slot).1, domains.clone());
+                }
                 let (tx, rx) = watch::channel(None);
                 std::mem::forget(tx); // never resolves; stop() kills by pid
                 self.vms.lock().expect("vms lock").insert(meta.id.clone(), Vm { meta, exit: rx, adopted: true });
@@ -748,9 +818,6 @@ impl Inner {
     }
 
     async fn do_start(self: &Arc<Self>, spec: &RunnerSpec) -> anyhow::Result<String> {
-        if spec.network != Network::Open {
-            bail!("firecracker backend: egress allowlists are not implemented yet (strawgate/rgha#22)");
-        }
         self.rootfs.get_or_try_init(|| self.build_rootfs()).await?;
         self.scratch.get_or_try_init(|| self.build_scratch()).await?;
         let vcpus = (spec.cpu_limit.ceil() as u32).clamp(1, 32);
@@ -759,8 +826,21 @@ impl Inner {
 
         let id = spec.name.clone();
         let slot = self.alloc_slot()?;
-        let res = self.start_vm(spec, &id, slot, vcpus, mem, template.as_ref()).await;
+        let allow = match &spec.network {
+            Network::Open => None,
+            Network::Allowlist { domains, cidrs } => Some((domains.clone(), cidrs.clone())),
+        };
+        let res = async {
+            if let Some((domains, cidrs)) = &allow {
+                self.apply_egress(slot, domains, cidrs).await?;
+            }
+            self.start_vm(spec, &id, slot, vcpus, mem, template.as_ref(), allow.clone()).await
+        }
+        .await;
         if res.is_err() {
+            if let Some((_, cidrs)) = &allow {
+                self.remove_egress(slot, cidrs).await;
+            }
             self.teardown(&id, slot).await;
         }
         res.map(|_| id)
@@ -811,6 +891,7 @@ impl Inner {
             .collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_vm(
         self: &Arc<Self>,
         spec: &RunnerSpec,
@@ -819,6 +900,7 @@ impl Inner {
         vcpus: u32,
         mem: u32,
         template: Option<&Template>,
+        allow: Option<(Vec<String>, Vec<String>)>,
     ) -> anyhow::Result<()> {
         let epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs_f64();
         let config = config_drive(&spec.jit_config, epoch)?;
@@ -864,7 +946,7 @@ impl Inner {
                 self.spawn(id, slot, &layout, &["--no-api", "--config-file", "vm.json"], &console)?
             }
         };
-        self.track(spec, id, slot, child).await
+        self.track(spec, id, slot, child, allow).await
     }
 
     async fn track(
@@ -873,6 +955,7 @@ impl Inner {
         id: &str,
         slot: u32,
         mut child: tokio::process::Child,
+        allow: Option<(Vec<String>, Vec<String>)>,
     ) -> anyhow::Result<()> {
         let pid = child.id().context("firecracker pid")?;
         let meta = Meta {
@@ -882,6 +965,7 @@ impl Inner {
             slot,
             pid,
             jailed: self.s.jailer.is_some(),
+            allow,
         };
         tokio::fs::write(self.vms_dir().join(id).join("meta.json"), serde_json::to_vec(&meta)?).await?;
         let cleanup_meta: Meta = serde_json::from_slice(&serde_json::to_vec(&meta)?)?;
@@ -940,6 +1024,19 @@ mod tests {
         assert_eq!(drives[2]["path_on_host"], "scratch.ext4");
         assert_eq!(v["network-interfaces"][0]["host_dev_name"], "tap0");
         assert!(v.get("entropy").is_some(), "virtio-rng for clones");
+    }
+
+    #[test]
+    fn egress_rules_redirect_web_allow_dns_and_drop_the_rest() {
+        let r = egress_rules(5, "1.1.1.1", &["203.0.113.0/24".into()]);
+        let flat: Vec<String> = r.iter().map(|(t, c, a)| format!("{t} {c} {}", a.join(" "))).collect();
+        assert!(flat.contains(&"nat RGHA-PRE -i rgha-v5 -p tcp --dport 443 -j REDIRECT --to-ports 15443".to_string()));
+        assert!(flat.contains(&"nat RGHA-PRE -i rgha-v5 -p tcp --dport 80 -j REDIRECT --to-ports 15080".to_string()));
+        // Each filter rule is inserted at the top, so the DROP (first) ends up last.
+        let filter: Vec<&String> = flat.iter().filter(|f| f.starts_with("filter")).collect();
+        assert_eq!(filter.first().unwrap().as_str(), "filter RGHA-FWD -i rgha-v5 -j DROP");
+        assert!(filter.iter().any(|f| f.ends_with("-d 203.0.113.0/24 -j ACCEPT")));
+        assert!(filter.iter().any(|f| f.contains("-p udp -d 1.1.1.1 --dport 53 -j ACCEPT")));
     }
 
     #[test]

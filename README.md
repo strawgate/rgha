@@ -62,7 +62,8 @@ shell, Node, Python, Docker, 10-job burst; [full results](https://github.com/str
 |---|---|---|---|
 | GitHub-hosted (private-repo price) | 3–5 s | baseline | $0.252 |
 | rgha, scale to zero | 7–8 s | same; Docker builds ~2× faster | **$0.040** (~6× less) |
-| rgha, warm pools sized to the burst | 3–4 s | same; Docker builds ~2× faster | $0.174 incl. a 10-min idle tail of 14 warm runners |
+| rgha, fixed warm pools sized to the burst | 3–4 s | same; Docker builds ~2× faster | $0.174 incl. a 10-min idle tail of 14 warm runners |
+| rgha, adaptive warm pools + tiny idle requests | 3–7.5 s | same; Docker builds ~2× faster | **$0.061** incl. a 14-min gradual shrink (~4× less) |
 
 The advantage shrinks for long, bigger jobs: a 3-minute job at 1 Modal core
 (2 vCPU) / 4 GiB is only ~1.4× cheaper than a 2-core hosted runner. Standard GitHub-hosted runners are **free for public repos**, so

@@ -148,6 +148,47 @@ impl Pool {
     }
 }
 
+/// Adaptive warm-pool size: grows slowly while jobs keep starting cold,
+/// shrinks slowly once they stop. Additive in both directions, so one big
+/// burst nudges the pool up by one runner rather than by the burst size.
+#[derive(Debug, Clone)]
+pub struct AdaptiveWarm {
+    pub floor: u32,
+    pub max: u32,
+    pub grow_every: Duration,
+    pub shrink_every: Duration,
+    target: u32,
+    last_grow: Option<Instant>,
+    /// Last cold start or shrink; shrinking waits `shrink_every` after it.
+    quiet_since: Instant,
+}
+
+impl AdaptiveWarm {
+    pub fn new(floor: u32, max: u32, grow_every: Duration, shrink_every: Duration, now: Instant) -> Self {
+        Self { floor, max: max.max(floor), grow_every, shrink_every, target: floor, last_grow: None, quiet_since: now }
+    }
+
+    pub fn target(&self) -> u32 {
+        self.target
+    }
+
+    /// Updates the target given whether jobs are waiting without a runner.
+    pub fn observe(&mut self, cold_starts: bool, now: Instant) -> u32 {
+        if cold_starts {
+            self.quiet_since = now;
+            let can_grow = self.last_grow.is_none_or(|t| now.saturating_duration_since(t) >= self.grow_every);
+            if self.target < self.max && can_grow {
+                self.target += 1;
+                self.last_grow = Some(now);
+            }
+        } else if self.target > self.floor && now.saturating_duration_since(self.quiet_since) >= self.shrink_every {
+            self.target -= 1;
+            self.quiet_since = now;
+        }
+        self.target
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,7 +247,42 @@ mod tests {
         assert!(p.reap_candidates(0, Duration::ZERO, t0 + Duration::from_secs(999)).is_empty());
     }
 
+    #[test]
+    fn adaptive_warm_grows_and_shrinks_one_at_a_time() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut w = AdaptiveWarm::new(0, 3, s(60), s(300), t0);
+        assert_eq!(w.observe(true, t0), 1, "first cold start: +1");
+        assert_eq!(w.observe(true, t0 + s(10)), 1, "rate-limited");
+        assert_eq!(w.observe(true, t0 + s(60)), 2);
+        assert_eq!(w.observe(true, t0 + s(120)), 3);
+        assert_eq!(w.observe(true, t0 + s(180)), 3, "capped at max");
+        assert_eq!(w.observe(false, t0 + s(400)), 3, "not quiet long enough");
+        assert_eq!(w.observe(false, t0 + s(480)), 2, "quiet for shrink_every: -1");
+        assert_eq!(w.observe(false, t0 + s(500)), 2);
+        assert_eq!(w.observe(false, t0 + s(780)), 1);
+        assert_eq!(w.observe(false, t0 + s(1080)), 0);
+        assert_eq!(w.observe(false, t0 + s(9999)), 0, "floor");
+    }
+
     proptest! {
+        /// Target stays within [floor, max] and moves by at most 1 per observation.
+        #[test]
+        fn adaptive_warm_bounds(floor in 0u32..3, extra in 0u32..5, events in proptest::collection::vec((any::<bool>(), 0u64..400), 0..60)) {
+            let t0 = Instant::now();
+            let mut w = AdaptiveWarm::new(floor, floor + extra, Duration::from_secs(60), Duration::from_secs(300), t0);
+            let mut now = t0;
+            let mut prev = w.target();
+            for (cold, dt) in events {
+                now += Duration::from_secs(dt);
+                let t = w.observe(cold, now);
+                prop_assert!(t >= floor && t <= floor + extra);
+                prop_assert!(t.abs_diff(prev) <= 1);
+                if cold { prop_assert!(t >= prev, "never shrinks during cold starts"); }
+                prev = t;
+            }
+        }
+
         /// Never plan more runners than max, and never reap below desired.
         #[test]
         fn invariants(min_idle in 0u32..4, max in 0u32..8, assigned in -2i64..20,

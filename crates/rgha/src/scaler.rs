@@ -16,7 +16,7 @@ use crate::config::ClassConfig;
 use crate::cost::{Ledger, Pricing, github_hosted_cost};
 use crate::metrics;
 use crate::policy::{Decision, JobContext};
-use crate::pool::{Departed, Pool, State};
+use crate::pool::{AdaptiveWarm, Departed, Pool, State};
 
 /// How often to look for instances the pool doesn't know about.
 const RECONCILE_EVERY: Duration = Duration::from_secs(5 * 60);
@@ -78,6 +78,8 @@ pub struct ClassScaler {
     /// Last time a job was offered, assigned or started (drives `warm_for_secs`).
     last_activity: Option<Instant>,
     warm: bool,
+    /// Set when the class uses `warm_max` (adaptive warm pool).
+    adaptive: Option<AdaptiveWarm>,
     pub ledger: Ledger,
 }
 
@@ -91,6 +93,15 @@ impl ClassScaler {
     ) -> Self {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let pool = Pool::new(class.min_idle, class.max_runners);
+        let adaptive = class.warm_max.map(|max| {
+            AdaptiveWarm::new(
+                class.min_idle,
+                max,
+                Duration::from_secs(class.warm_grow_secs),
+                Duration::from_secs(class.warm_shrink_secs),
+                Instant::now(),
+            )
+        });
         Self {
             class,
             scale_set_id,
@@ -108,6 +119,7 @@ impl ClassScaler {
             last_reconcile: None,
             last_activity: None,
             warm: false,
+            adaptive,
             ledger: Ledger::default(),
         }
     }
@@ -408,6 +420,17 @@ impl ClassScaler {
     /// Applies `warm_for_secs`: the warm pool only exists for a while after
     /// the last job activity. Surplus warm runners are then reaped normally.
     fn update_warm_pool(&mut self, now: Instant) {
+        // Jobs waiting without a runner means they are starting cold.
+        let cold = self.assigned() > self.pool.len() as i64;
+        if let Some(adaptive) = &mut self.adaptive {
+            let before = adaptive.target();
+            let target = adaptive.observe(cold, now);
+            if target != before {
+                tracing::info!(class = %self.class.name, from = before, to = target, cold, "warm pool target");
+            }
+            self.pool.min_idle = target;
+            return;
+        }
         let warm = warm_active(self.class.warm_for_secs, self.last_activity, now);
         if warm != self.warm {
             tracing::info!(class = %self.class.name, warm, min_idle = self.class.min_idle, "warm pool {}", if warm { "on" } else { "off" });

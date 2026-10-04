@@ -169,6 +169,15 @@ pub struct ClassConfig {
     /// activity (bursts get instant pickup; quiet periods cost nothing).
     /// Default: always warm.
     pub warm_for_secs: Option<u64>,
+    /// Adaptive warm pool ceiling. When set, the warm pool starts at
+    /// `min_idle` and grows by one runner (at most every `warm_grow_secs`)
+    /// while jobs start cold, then shrinks by one every `warm_shrink_secs`
+    /// without cold starts.
+    pub warm_max: Option<u32>,
+    #[serde(default = "default_warm_grow_secs")]
+    pub warm_grow_secs: u64,
+    #[serde(default = "default_warm_shrink_secs")]
+    pub warm_shrink_secs: u64,
     #[serde(default = "default_max_runners")]
     pub max_runners: u32,
     /// Idle runners kept warm. 0 = pure scale-to-zero (cheapest).
@@ -195,6 +204,12 @@ pub struct ClassConfig {
     pub allow_warm_trusted: bool,
 }
 
+fn default_warm_grow_secs() -> u64 {
+    60
+}
+fn default_warm_shrink_secs() -> u64 {
+    300
+}
 fn default_cpu() -> f64 {
     0.25
 }
@@ -286,7 +301,16 @@ impl Config {
             if c.memory_limit_mib.is_some_and(|l| l < c.memory_mib) {
                 bail!("class {:?}: memory_limit_mib must be >= memory_mib", c.name);
             }
-            if c.policy.trust == crate::policy::Trust::Trusted && c.min_idle > 0 && !c.allow_warm_trusted {
+            if let Some(max) = c.warm_max {
+                if max < c.min_idle {
+                    bail!("class {:?}: warm_max must be >= min_idle", c.name);
+                }
+                if c.warm_for_secs.is_some() {
+                    bail!("class {:?}: use either warm_for_secs or warm_max (adaptive), not both", c.name);
+                }
+            }
+            let may_warm = c.min_idle > 0 || c.warm_max.is_some_and(|m| m > 0);
+            if c.policy.trust == crate::policy::Trust::Trusted && may_warm && !c.allow_warm_trusted {
                 bail!(
                     "class {:?}: trusted classes default to min_idle = 0. GitHub assigns jobs to a scale set before \
                      rgha can check them, so a warm runner could start a disallowed job before rgha cancels it. \

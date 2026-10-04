@@ -75,7 +75,12 @@ and jobs can still burst.
   `cpu = 0.125`, `memory_mib = 256` (and `cpu_limit = 2.0`,
   `memory_limit_mib = 2048` for jobs), that is about **$0.024/hour**, and
   pickup was still 0.1 s.
-- `warm_for_secs` keeps the warm pool only for that long after the last job.
+- `warm_max` makes the warm pool adaptive. It starts at `min_idle`, grows by
+  one runner (at most every `warm_grow_secs`, default 60) while jobs start
+  cold, and shrinks by one after every `warm_shrink_secs` (default 300) without
+  cold starts. A 10-job burst nudges the pool up by one runner, not ten; only
+  sustained demand grows it further.
+- `warm_for_secs` (alternative to `warm_max`) keeps the full `min_idle` pool only for that long after the last job.
   The first job of a burst starts cold; the rest of the burst gets warm
   pickup; quiet periods cost nothing. With `warm_for_secs = 600`, the pool
   switched off 10 minutes after the last job, and that idle runner had cost

@@ -1,0 +1,30 @@
+# Manually-triggered smoke job that runs on an rgha-managed sandbox.
+name: rgha-demo
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tiny:
+    runs-on: rgha-tiny
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Where am I?
+        run: |
+          echo "runner: $RUNNER_NAME"
+          uname -a
+          nproc
+          free -m || true
+      - name: GitHub is reachable
+        run: curl -fsS -o /dev/null -w '%{http_code}\n' https://api.github.com
+      - name: Arbitrary egress is blocked (network = github-only)
+        run: |
+          if curl -fsS --max-time 5 https://example.com -o /dev/null; then
+            echo "::warning::example.com was reachable; egress is not restricted"
+          else
+            echo "blocked as expected"
+          fi

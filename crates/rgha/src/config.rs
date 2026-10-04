@@ -128,6 +128,12 @@ pub enum BackendConfig {
         docker_bin: String,
         #[serde(default = "default_rootfs_gib")]
         rootfs_size_gib: u32,
+        /// Per-VM writable scratch disk (sparse; overlayed on the read-only rootfs).
+        #[serde(default = "default_scratch_gib")]
+        scratch_size_gib: u32,
+        /// Restore jobs from memory snapshots of a pre-booted template (fast boot).
+        #[serde(default = "default_true")]
+        snapshots: bool,
         /// A /16 for VM networks (one /30 per VM).
         #[serde(default = "default_fc_subnet")]
         subnet: String,
@@ -147,6 +153,12 @@ fn default_fc_state_dir() -> String {
 }
 fn default_rootfs_gib() -> u32 {
     8
+}
+fn default_scratch_gib() -> u32 {
+    16
+}
+fn default_true() -> bool {
+    true
 }
 fn default_fc_subnet() -> String {
     "10.213.0.0/16".into()

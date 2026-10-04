@@ -37,7 +37,7 @@ impl DockerBackend {
             "--cpus".into(),
             format!("{}", spec.cpu_limit),
             "--memory".into(),
-            format!("{}m", spec.memory_mib),
+            format!("{}m", spec.memory_limit_mib),
             // Keep Docker's default capability set: many workflows rely on
             // `sudo`. Isolation comes from the OCI runtime (gVisor/Kata).
             "--pids-limit".into(),
@@ -143,6 +143,7 @@ mod tests {
             cpu: 0.5,
             cpu_limit: 0.5,
             memory_mib: 768,
+            memory_limit_mib: 768,
             timeout: Duration::from_secs(60),
             network: Network::Open,
         };

@@ -69,6 +69,9 @@ pub struct ClassScaler {
     blocked: HashMap<String, Instant>,
     backoff: StartBackoff,
     last_reconcile: Option<Instant>,
+    /// Last time a job was offered, assigned or started (drives `warm_for_secs`).
+    last_activity: Option<Instant>,
+    warm: bool,
     pub ledger: Ledger,
 }
 
@@ -95,6 +98,8 @@ impl ClassScaler {
             blocked: HashMap::new(),
             backoff: StartBackoff::default(),
             last_reconcile: None,
+            last_activity: None,
+            warm: false,
             ledger: Ledger::default(),
         }
     }
@@ -350,6 +355,17 @@ impl ClassScaler {
         }
     }
 
+    /// Applies `warm_for_secs`: the warm pool only exists for a while after
+    /// the last job activity. Surplus warm runners are then reaped normally.
+    fn update_warm_pool(&mut self, now: Instant) {
+        let warm = warm_active(self.class.warm_for_secs, self.last_activity, now);
+        if warm != self.warm {
+            tracing::info!(class = %self.class.name, warm, min_idle = self.class.min_idle, "warm pool {}", if warm { "on" } else { "off" });
+            self.warm = warm;
+        }
+        self.pool.min_idle = if warm { self.class.min_idle } else { 0 };
+    }
+
     fn publish_gauges(&self) {
         let busy = self.pool.runners().filter(|r| r.state == State::Busy).count();
         metrics::pool(&self.class.name, self.pool.len() - busy, busy, self.assigned());
@@ -388,7 +404,11 @@ impl rgha_scaleset::Scaler for ClassScaler {
             if msg.statistics.is_some() {
                 self.last_stats = msg.statistics;
             }
+            if !(msg.job_available.is_empty() && msg.job_assigned.is_empty() && msg.job_started.is_empty()) {
+                self.last_activity = Some(now);
+            }
         }
+        self.update_warm_pool(Instant::now());
         // Converge on every poll, including empty ones, using cached stats.
         let deficit = self.pool.deficit(self.assigned());
         self.start_runners(deficit).await;
@@ -401,13 +421,20 @@ impl rgha_scaleset::Scaler for ClassScaler {
     }
 }
 
-/// Busy time is priced at the CPU cap (an upper bound for bursting jobs);
-/// idle/boot time at the request, which is what Modal bills when the
-/// sandbox is mostly waiting.
+/// Busy time is priced at the CPU and memory caps (an upper bound for
+/// bursting jobs); idle/boot time at the requests, which is what Modal bills
+/// when the sandbox is mostly waiting.
 fn sandbox_cost(pricing: &Pricing, class: &ClassConfig, sandbox_secs: f64, job_secs: Option<f64>) -> f64 {
     let busy = job_secs.unwrap_or(0.0).clamp(0.0, sandbox_secs);
-    let cap = class.cpu_limit.unwrap_or(class.cpu);
-    pricing.cost(cap, class.memory_mib, busy) + pricing.cost(class.cpu, class.memory_mib, sandbox_secs - busy)
+    pricing.cost(class.cpu_cap(), class.memory_cap_mib(), busy)
+        + pricing.cost(class.cpu, class.memory_mib, sandbox_secs - busy)
+}
+
+fn warm_active(warm_for_secs: Option<u64>, last_activity: Option<Instant>, now: Instant) -> bool {
+    match warm_for_secs {
+        None => true,
+        Some(w) => last_activity.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(w)),
+    }
 }
 
 /// The service sends `0001-01-01T00:00:00Z` for unset timestamps.
@@ -468,6 +495,7 @@ async fn start_one(
         cpu: class.cpu,
         cpu_limit: class.cpu_limit.unwrap_or(class.cpu),
         memory_mib: class.memory_mib,
+        memory_limit_mib: class.memory_cap_mib(),
         timeout: class.sandbox_timeout(),
         network: Network::for_class(class),
     };
@@ -508,6 +536,25 @@ mod tests {
         assert!((sandbox_cost(&p, &class, 5.0, Some(9.0)) - 10.0).abs() < 1e-9);
         class.cpu_limit = None;
         assert!((sandbox_cost(&p, &class, 30.0, Some(10.0)) - 7.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn warm_window() {
+        let t0 = Instant::now();
+        assert!(warm_active(None, None, t0), "no window = always warm");
+        assert!(!warm_active(Some(300), None, t0), "cold until the first job");
+        assert!(warm_active(Some(300), Some(t0), t0 + Duration::from_secs(299)));
+        assert!(!warm_active(Some(300), Some(t0), t0 + Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn memory_cap_priced_while_busy() {
+        let class: ClassConfig =
+            toml::from_str("name = \"c\"\nbackend = \"b\"\ncpu = 0.125\nmemory_mib = 256\nmemory_limit_mib = 4096")
+                .unwrap();
+        let p = Pricing { cpu_per_sec: 0.0, gib_per_sec: 1.0, min_billed_secs: 0.0 };
+        // 10s busy at 4 GiB + 20s idle at 0.25 GiB
+        assert!((sandbox_cost(&p, &class, 30.0, Some(10.0)) - 45.0).abs() < 1e-9);
     }
 
     #[test]

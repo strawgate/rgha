@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use rgha_scaleset::{Client, Label, Listener, RunnerScaleSet};
+use rgha_scaleset::{Client, Label, Listener, RunnerScaleSet, RunnerSetting};
 use tokio::sync::watch;
 
 use crate::backend::Backend;
@@ -24,21 +24,26 @@ pub struct ClassController {
 }
 
 impl ClassController {
+    /// Gets or creates the scale set. Runner self-update is disabled: an
+    /// ephemeral runner updating itself mid-pickup costs ~30 s, and the
+    /// image is pinned/rebuilt by the operator instead.
     async fn ensure_scale_set(&self) -> anyhow::Result<RunnerScaleSet> {
+        let desired = RunnerScaleSet {
+            name: self.class.name.clone(),
+            runner_group_id: self.runner_group_id,
+            labels: vec![Label::system(self.class.name.clone())],
+            runner_setting: RunnerSetting { disable_update: true },
+            ..Default::default()
+        };
         if let Some(ss) = self.client.get_scale_set(self.runner_group_id, &self.class.name).await? {
-            return Ok(ss);
+            if ss.runner_setting.disable_update {
+                return Ok(ss);
+            }
+            tracing::info!(class = %self.class.name, "updating scale set: disable runner self-update");
+            return Ok(self.client.update_scale_set(ss.id, desired).await?);
         }
         tracing::info!(class = %self.class.name, "creating runner scale set");
-        let ss = self
-            .client
-            .create_scale_set(RunnerScaleSet {
-                name: self.class.name.clone(),
-                runner_group_id: self.runner_group_id,
-                labels: vec![Label::system(self.class.name.clone())],
-                ..Default::default()
-            })
-            .await?;
-        Ok(ss)
+        Ok(self.client.create_scale_set(desired).await?)
     }
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {

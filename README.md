@@ -40,6 +40,15 @@ Measured on this repo's [demo workflow](.github/workflows/rgha-demo.yml)
 Without the burst cap (`cpu_limit = cpu = 0.25`), the .NET runner and Node
 actions are CPU-starved: pickup took 8–10 s and the same job took 14–45 s.
 
+**Cheap warm pools.** A warm runner requesting 0.125 core / 256 MiB (with
+limits of 2 cores / 2 GiB for jobs) costs about $0.024/hour and still picks
+up in 0.1 s. With `warm_for_secs`, the pool only exists for a while after the
+last job.
+
+**Preloaded images.** Baking actions and Node/Python into the image cut
+`setup-python` from 9 s to 1 s, and real test jobs from 15–20 s to 7–8 s. See
+[docs/operations.md](docs/operations.md#preloading-the-image).
+
 **Docker-in-job** works on Modal's VM runtime (`runtime = "vm"`, `docker = true`):
 `docker run hello-world` passed with about 10 s cold pickup.
 

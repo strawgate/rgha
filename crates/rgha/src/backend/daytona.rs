@@ -105,7 +105,7 @@ impl DaytonaBackend {
             "name": spec.name,
             // Daytona allocates whole cores and GB. Size to the burst cap.
             "cpu": spec.cpu_limit.ceil().max(1.0) as u32,
-            "memory": spec.memory_mib.div_ceil(1024).max(1),
+            "memory": spec.memory_limit_mib.div_ceil(1024).max(1),
             "disk": self.disk_gib,
             // The JIT config is single-use and bound to this runner.
             "env": { JIT_ENV: spec.jit_config, "RUNNER_ALLOW_RUNASROOT": "1" },
@@ -288,7 +288,8 @@ mod tests {
             jit_config: "JIT".into(),
             cpu: 0.25,
             cpu_limit: 2.0,
-            memory_mib: 1536,
+            memory_mib: 1024,
+            memory_limit_mib: 1536,
             timeout: Duration::from_secs(61 * 60),
             network,
         }

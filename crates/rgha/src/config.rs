@@ -65,6 +65,9 @@ pub enum BackendConfig {
         /// Start dockerd in each sandbox so jobs can use Docker. Requires runtime = "vm".
         #[serde(default)]
         docker: bool,
+        /// Actions and toolchains baked into the image (see `image.rs`).
+        #[serde(default)]
+        preload: crate::image::Preload,
         pricing: Option<Pricing>,
     },
     /// Local containers via the docker CLI. Plain `runc` shares the host
@@ -158,6 +161,14 @@ pub struct ClassConfig {
     pub cpu_limit: Option<f64>,
     #[serde(default = "default_memory")]
     pub memory_mib: u32,
+    /// Hard memory cap; may exceed `memory_mib`. Modal bills max(request,
+    /// usage), so a small request with a high limit keeps warm runners cheap
+    /// while jobs can still use more. Default: same as `memory_mib`.
+    pub memory_limit_mib: Option<u32>,
+    /// Keep the `min_idle` warm pool only for this long after the last job
+    /// activity (bursts get instant pickup; quiet periods cost nothing).
+    /// Default: always warm.
+    pub warm_for_secs: Option<u64>,
     #[serde(default = "default_max_runners")]
     pub max_runners: u32,
     /// Idle runners kept warm. 0 = pure scale-to-zero (cheapest).
@@ -225,6 +236,14 @@ pub const GITHUB_RUNNER_DOMAINS: &[&str] = &[
 ];
 
 impl ClassConfig {
+    pub fn cpu_cap(&self) -> f64 {
+        self.cpu_limit.unwrap_or(self.cpu)
+    }
+
+    pub fn memory_cap_mib(&self) -> u32 {
+        self.memory_limit_mib.unwrap_or(self.memory_mib)
+    }
+
     pub fn max_job(&self) -> Duration {
         Duration::from_secs(self.max_job_minutes * 60)
     }
@@ -263,6 +282,9 @@ impl Config {
             }
             if c.cpu_limit.is_some_and(|l| l < c.cpu) {
                 bail!("class {:?}: cpu_limit must be >= cpu", c.name);
+            }
+            if c.memory_limit_mib.is_some_and(|l| l < c.memory_mib) {
+                bail!("class {:?}: memory_limit_mib must be >= memory_mib", c.name);
             }
             if c.policy.trust == crate::policy::Trust::Trusted && c.min_idle > 0 && !c.allow_warm_trusted {
                 bail!(
@@ -306,6 +328,9 @@ impl Config {
             }
         }
         for (name, b) in &self.backends {
+            if let BackendConfig::Modal { preload, .. } = b {
+                preload.validate().map_err(|e| anyhow::anyhow!("backend {name:?}: {e}"))?;
+            }
             if let BackendConfig::Modal { docker: true, runtime, .. } = b
                 && runtime.as_deref() != Some("vm")
             {

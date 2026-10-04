@@ -36,6 +36,7 @@ pub struct ModalSettings<'a> {
     pub runtime: Option<String>,
     pub regions: Vec<String>,
     pub docker: bool,
+    pub preload: &'a crate::image::Preload,
 }
 
 /// Layered on the runner image when `docker = true`. The official image
@@ -55,7 +56,10 @@ impl ModalBackend {
     pub async fn connect(name: &str, s: ModalSettings<'_>) -> anyhow::Result<Self> {
         let profile = Profile::load(s.profile).context("loading Modal credentials")?;
         let client = Client::connect(profile).await.context("connecting to Modal")?;
-        let mut image_commands = s.image_commands.to_vec();
+        // Preloads first (cached layers shared by every class on this image),
+        // then user commands, then the Docker layer.
+        let mut image_commands = s.preload.dockerfile_commands();
+        image_commands.extend(s.image_commands.iter().cloned());
         if s.docker {
             image_commands.extend(DOCKER_IMAGE_COMMANDS.iter().map(|c| c.to_string()));
         }
@@ -85,7 +89,7 @@ impl ModalBackend {
     }
 }
 
-pub(crate) fn sandbox_spec(
+pub fn sandbox_spec(
     spec: &RunnerSpec,
     image_id: &str,
     runtime: Option<String>,
@@ -117,7 +121,7 @@ pub(crate) fn sandbox_spec(
         cpu: spec.cpu,
         cpu_limit: Some(spec.cpu_limit),
         memory_mib: spec.memory_mib,
-        memory_limit_mib: Some(spec.memory_mib),
+        memory_limit_mib: Some(spec.memory_limit_mib),
         timeout: spec.timeout,
         network,
         runtime,
@@ -127,6 +131,7 @@ pub(crate) fn sandbox_spec(
             (TAG_CLASS.to_string(), spec.class.clone()),
             (TAG_RUNNER.to_string(), spec.name.clone()),
         ]),
+        enable_snapshot: false,
     }
 }
 
@@ -185,6 +190,7 @@ mod tests {
             cpu: 0.25,
             cpu_limit: 0.25,
             memory_mib: 512,
+            memory_limit_mib: 2048,
             timeout: Duration::from_secs(600),
             network: Network::Allowlist { domains: vec!["github.com".into()], cidrs: vec![] },
         };
@@ -196,6 +202,7 @@ mod tests {
         assert!(!sb.command.iter().any(|a| a.contains("SECRET")));
         assert!(!sb.tags.values().any(|v| v.contains("SECRET")));
         assert_eq!(sb.cpu_limit, Some(0.25));
+        assert_eq!((sb.memory_mib, sb.memory_limit_mib), (512, Some(2048)));
         assert!(matches!(sb.network, rgha_modal::Network::Allowlist { .. }));
         assert_eq!(sb.tags.get(TAG_CLASS).map(String::as_str), Some("c"));
     }

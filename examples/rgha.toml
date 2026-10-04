@@ -15,6 +15,11 @@ type = "modal"
 app = "rgha"
 image = "ghcr.io/actions/actions-runner:latest"
 # image_commands = ["USER root", "RUN apt-get update && apt-get install -y build-essential"]
+# Bake actions and toolchains into the image (no per-job downloads).
+[backends.modal.preload]
+actions = ["actions/checkout@v5", "actions/setup-node@v5", "actions/setup-python@v6"]
+node = ["22"]
+python = ["3.12"]
 
 # Modal VM runtime (alpha): real kernel, so jobs can use Docker.
 [backends.modal-vm]
@@ -38,9 +43,11 @@ name = "rgha-tiny"
 backend = "modal"
 cpu = 0.125              # Modal physical cores (1 core = 2 vCPU), the billed floor
 cpu_limit = 2.0          # burst cap: ~3x faster runner boot; billed by actual usage
-memory_mib = 512
+memory_mib = 256         # billed floor while idle...
+memory_limit_mib = 2048  # ...jobs can use up to this (billed on usage)
 max_runners = 20
-min_idle = 1             # one warm runner: ~0.1s pickup; 0 = scale to zero (~3-5s pickup)
+min_idle = 1             # one warm runner: ~0.1s pickup, ~$0.024/h at these requests
+warm_for_secs = 900      # ...kept only for 15 min after the last job
 max_job_minutes = 10
 network = "github-only"  # egress limited to GitHub runner endpoints
 [class.policy]

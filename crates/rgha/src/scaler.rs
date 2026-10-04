@@ -15,7 +15,7 @@ use crate::backend::{Backend, Network, RunnerSpec};
 use crate::config::ClassConfig;
 use crate::cost::{Ledger, Pricing, github_hosted_cost};
 use crate::metrics;
-use crate::policy::Decision;
+use crate::policy::{Decision, JobContext};
 use crate::pool::{Departed, Pool, State};
 
 /// How often to look for instances the pool doesn't know about.
@@ -70,6 +70,10 @@ pub struct ClassScaler {
     /// so no runner is started that could pick them up.
     blocked: HashMap<String, Instant>,
     backoff: StartBackoff,
+    /// Fork status per workflow run id (only looked up when a policy needs it).
+    fork_cache: HashMap<i64, bool>,
+    /// Runs already being cancelled (several rejected jobs can share a run).
+    cancelled_runs: HashMap<i64, Instant>,
     last_reconcile: Option<Instant>,
     /// Last time a job was offered, assigned or started (drives `warm_for_secs`).
     last_activity: Option<Instant>,
@@ -99,6 +103,8 @@ impl ClassScaler {
             events_rx,
             blocked: HashMap::new(),
             backoff: StartBackoff::default(),
+            fork_cache: HashMap::new(),
+            cancelled_runs: HashMap::new(),
             last_reconcile: None,
             last_activity: None,
             warm: false,
@@ -125,11 +131,44 @@ impl ClassScaler {
         );
     }
 
+    /// Extra facts the class policy needs about a job; looked up only when
+    /// required, cached per run. A failed lookup leaves `fork = None`, which
+    /// the policy treats as "not verified" (fail closed).
+    async fn job_context(&mut self, job: &JobMessageBase) -> JobContext {
+        if !self.class.policy.needs_fork_info(job) {
+            return JobContext::default();
+        }
+        if let Some(fork) = self.fork_cache.get(&job.workflow_run_id) {
+            return JobContext { fork: Some(*fork) };
+        }
+        let mut fork = None;
+        for attempt in 0..3u32 {
+            match self.client.get_workflow_run(&job.owner_name, &job.repository_name, job.workflow_run_id).await {
+                Ok(run) => {
+                    fork = run.is_fork();
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(class = %self.class.name, run_id = job.workflow_run_id, attempt, error = %e, "workflow run lookup failed");
+                    tokio::time::sleep(Duration::from_millis(RETRY_BASE_MS * (1 << attempt))).await;
+                }
+            }
+        }
+        if let Some(f) = fork {
+            if self.fork_cache.len() > 10_000 {
+                self.fork_cache.clear();
+            }
+            self.fork_cache.insert(job.workflow_run_id, f);
+        }
+        JobContext { fork }
+    }
+
     /// Legacy flow: jobs offered as `JobAvailable` are only acquired if allowed.
     async fn acquire(&mut self, session: &MessageSession, msg: &ScaleSetMessage) -> rgha_scaleset::Result<()> {
         let mut ids = Vec::new();
         for job in &msg.job_available {
-            match self.class.policy.evaluate(&job.base) {
+            let ctx = self.job_context(&job.base).await;
+            match self.class.policy.evaluate(&job.base, ctx) {
                 Decision::Acquire => ids.push(job.base.runner_request_id),
                 Decision::Reject(reason) => self.log_reject(&job.base, &reason, "not acquiring"),
             }
@@ -144,13 +183,22 @@ impl ClassScaler {
     /// Current flow: the service assigns jobs to the scale set directly
     /// (`JobAssigned`, no acquire step), so a disallowed job can only be
     /// stopped by cancelling its workflow run.
-    fn enforce_assigned(&mut self, msg: &ScaleSetMessage) {
+    async fn enforce_assigned(&mut self, msg: &ScaleSetMessage) {
         let now = Instant::now();
         self.blocked.retain(|_, at| now.saturating_duration_since(*at) < Duration::from_secs(15 * 60));
         for job in &msg.job_assigned {
-            let Decision::Reject(reason) = self.class.policy.evaluate(&job.base) else { continue };
+            if self.blocked.contains_key(&job.base.job_id) {
+                continue; // redelivered; already cancelling
+            }
+            let ctx = self.job_context(&job.base).await;
+            let Decision::Reject(reason) = self.class.policy.evaluate(&job.base, ctx) else { continue };
             if self.blocked.insert(job.base.job_id.clone(), now).is_some() {
                 continue; // redelivered; already cancelling
+            }
+            self.cancelled_runs.retain(|_, at| now.saturating_duration_since(*at) < Duration::from_secs(15 * 60));
+            if self.cancelled_runs.insert(job.base.workflow_run_id, now).is_some() {
+                self.log_reject(&job.base, &reason, "run already being cancelled");
+                continue;
             }
             self.log_reject(&job.base, &reason, "cancelling workflow run");
             let (client, b) = (self.client.clone(), job.base.clone());
@@ -382,7 +430,7 @@ impl rgha_scaleset::Scaler for ClassScaler {
             tracing::debug!(class = %self.class.name, ?msg, "message");
             // Acquire first so jobs are assigned as early as possible.
             self.acquire(session, msg).await?;
-            self.enforce_assigned(msg);
+            self.enforce_assigned(msg).await;
             let now = Instant::now();
             for s in &msg.job_started {
                 if self.pool.job_started(&s.runner_name, now) {

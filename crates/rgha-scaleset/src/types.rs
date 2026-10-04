@@ -166,6 +166,33 @@ impl RunnerReference {
     }
 }
 
+/// The subset of a REST workflow run that policy decisions use.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct WorkflowRun {
+    pub id: i64,
+    #[serde(default)]
+    pub event: String,
+    #[serde(default)]
+    pub repository: Option<RepoRef>,
+    #[serde(default)]
+    pub head_repository: Option<RepoRef>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct RepoRef {
+    pub full_name: String,
+}
+
+impl WorkflowRun {
+    /// `Some(true)` if the run's head is in a different repository (a fork).
+    pub fn is_fork(&self) -> Option<bool> {
+        match (&self.repository, &self.head_repository) {
+            (Some(base), Some(head)) => Some(!base.full_name.eq_ignore_ascii_case(&head.full_name)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct JitRunnerConfig {
     pub runner: RunnerReference,
@@ -290,6 +317,21 @@ mod tests {
         assert!(r.is_online());
         let r: RunnerReference = serde_json::from_str(r#"{"id":1,"name":"r","status":2}"#).unwrap();
         assert!(r.is_online());
+    }
+
+    #[test]
+    fn workflow_run_fork_detection() {
+        let fork: WorkflowRun = serde_json::from_str(
+            r#"{"id":1,"event":"pull_request","repository":{"full_name":"o/r"},"head_repository":{"full_name":"x/r"}}"#,
+        )
+        .unwrap();
+        assert_eq!(fork.is_fork(), Some(true));
+        let same: WorkflowRun =
+            serde_json::from_str(r#"{"id":1,"repository":{"full_name":"o/r"},"head_repository":{"full_name":"O/R"}}"#)
+                .unwrap();
+        assert_eq!(same.is_fork(), Some(false));
+        let unknown: WorkflowRun = serde_json::from_str(r#"{"id":1}"#).unwrap();
+        assert_eq!(unknown.is_fork(), None);
     }
 
     #[test]

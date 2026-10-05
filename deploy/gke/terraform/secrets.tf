@@ -28,6 +28,9 @@ resource "google_secret_manager_secret_iam_member" "controller" {
   secret_id = each.value.id
   role      = "roles/secretmanager.secretAccessor"
   member    = local.controller_principal
+  # The PROJECT.svc.id.goog workload identity pool exists only once a
+  # cluster with Workload Identity does.
+  depends_on = [google_container_cluster.rgha]
 }
 
 resource "google_secret_manager_secret_iam_member" "writers" {

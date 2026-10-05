@@ -1,0 +1,60 @@
+# Exactly one controller. GitHub allows one message session per scale set,
+# and Recreate avoids two pods overlapping during a rollout. Busy runners
+# survive controller restarts (they live in Modal); a restart reconciles.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rgha
+  namespace: rgha
+  labels: { app: rgha }
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: rgha }
+  template:
+    metadata:
+      labels: { app: rgha }
+    spec:
+      serviceAccountName: rgha
+      # Lets in-flight usage reads land (up to 30 s) before exit.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: rgha
+          image: rgha  # set by render.sh
+          args: ["run"]
+          env:
+            - { name: RGHA_CONFIG, value: /etc/rgha/rgha.toml }
+            - { name: RGHA_METRICS_ADDR, value: "0.0.0.0:9464" }
+            - { name: RGHA_LOG_JSON, value: "true" }
+            - { name: MODAL_CONFIG_PATH, value: /var/run/secrets/rgha/modal.toml }
+          ports:
+            - { name: metrics, containerPort: 9464 }
+          livenessProbe:
+            tcpSocket: { port: metrics }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/rgha, readOnly: true }
+            - { name: secrets, mountPath: /var/run/secrets/rgha, readOnly: true }
+      volumes:
+        - name: config
+          configMap: { name: rgha-config }
+        - name: secrets
+          csi:
+            driver: secrets-store-gke.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: rgha-secrets

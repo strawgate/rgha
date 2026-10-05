@@ -1,0 +1,80 @@
+# Reusable: build the controller image, push it to Artifact Registry and
+# deploy it to a GKE cluster made by deploy/gke/terraform. Run it from a fork
+# or private mirror of rgha that adds only your rgha.toml, e.g.:
+#
+#   jobs:
+#     deploy:
+#       uses: ./.github/workflows/deploy-gke.yml   # or strawgate/rgha/...@<sha>
+#       permissions: { contents: read, id-token: write }
+#       with:
+#         config: deploy/my-org/rgha.toml
+#         project_id: my-rgha-project
+#         workload_identity_provider: projects/123/locations/global/workloadIdentityPools/github/providers/github
+#         service_account: rgha-deployer@my-rgha-project.iam.gserviceaccount.com
+name: deploy-gke
+on:
+  workflow_call:
+    inputs:
+      config:
+        description: path to this deployment's rgha.toml
+        type: string
+        required: true
+      project_id:
+        type: string
+        required: true
+      region:
+        type: string
+        default: us-central1
+      cluster:
+        type: string
+        default: rgha
+      workload_identity_provider:
+        description: terraform output workload_identity_provider
+        type: string
+        required: true
+      service_account:
+        description: terraform output deployer_service_account
+        type: string
+        required: true
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: deploy-gke-${{ inputs.cluster }}
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      IMAGE: ${{ inputs.region }}-docker.pkg.dev/${{ inputs.project_id }}/rgha/rgha
+    steps:
+      - uses: actions/checkout@v5
+      - uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ inputs.workload_identity_provider }}
+          service_account: ${{ inputs.service_account }}
+      - uses: google-github-actions/setup-gcloud@v3
+      - run: gcloud auth configure-docker "${{ inputs.region }}-docker.pkg.dev" --quiet
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: google-github-actions/get-gke-credentials@v3
+        with:
+          cluster_name: ${{ inputs.cluster }}
+          location: ${{ inputs.region }}
+          project_id: ${{ inputs.project_id }}
+          use_dns_based_endpoint: true
+      - name: Apply
+        env:
+          CONFIG: ${{ inputs.config }}
+          PROJECT: ${{ inputs.project_id }}
+        run: |
+          deploy/gke/render.sh "$CONFIG" "$PROJECT" "${IMAGE}:${GITHUB_SHA}" > /tmp/rendered.yaml
+          kubectl apply -f /tmp/rendered.yaml
+          kubectl -n rgha rollout status deployment/rgha --timeout=5m

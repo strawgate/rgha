@@ -1,0 +1,28 @@
+# Example: one org-scoped class for light, trusted jobs. See
+# examples/rgha.toml in the repo root for every option.
+
+[github]
+url = "https://github.com/my-org"
+runner_group = "rgha"
+app_client_id = "Iv23liEXAMPLE"
+app_installation_id = 12345678
+app_private_key_path = "/var/run/secrets/rgha/github-app.pem"   # mounted from Secret Manager
+
+[backends.modal]
+type = "modal"
+app = "rgha"
+
+[[class]]
+name = "rgha-light"
+backend = "modal"
+cpu = 0.125
+cpu_limit = 2.0
+memory_mib = 128
+memory_limit_mib = 2048
+max_runners = 20
+max_job_minutes = 15
+network = "github-only"
+[class.policy]
+trust = "trusted"
+allowed_repos = ["my-org/my-repo"]
+allow_same_repo_prs = true

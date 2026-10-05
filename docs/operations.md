@@ -7,6 +7,10 @@ Modal. It needs no inbound ports except the optional metrics endpoint. Run one
 instance per set of classes: GitHub allows one message session per scale set,
 and a second instance waits until the first one's session closes.
 
+**GKE:** [deploy/gke](../deploy/gke) has a Terraform module (Autopilot,
+Secret Manager, Workload Identity), kustomize manifests and a reusable
+deploy workflow.
+
 **Container** (published to `ghcr.io/strawgate/rgha` on every `v*` tag):
 
 ```bash

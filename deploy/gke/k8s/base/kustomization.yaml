@@ -1,0 +1,10 @@
+# Generic rgha controller on GKE. ../../render.sh adds the per-deployment
+# parts: rgha.toml (as the rgha-config ConfigMap), the image, and the
+# project in the SecretProviderClass.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - secretproviderclass.yaml
+  - deployment.yaml

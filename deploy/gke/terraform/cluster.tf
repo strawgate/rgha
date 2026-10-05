@@ -47,6 +47,8 @@ resource "google_compute_router" "rgha" {
   name    = "${var.cluster_name}-router"
   region  = var.region
   network = "default"
+
+  depends_on = [google_project_service.services]
 }
 
 resource "google_compute_router_nat" "rgha" {

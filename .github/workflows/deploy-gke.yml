@@ -78,3 +78,19 @@ jobs:
           deploy/gke/render.sh "$CONFIG" "$PROJECT" "${IMAGE}:${GITHUB_SHA}" > /tmp/rendered.yaml
           kubectl apply -f /tmp/rendered.yaml
           kubectl -n rgha rollout status deployment/rgha --timeout=5m
+      - name: Verify the controller stays up
+        run: |
+          # rollout status passes as soon as the pod starts; a bad config or
+          # credential only fails a few seconds later, once the controller
+          # talks to GitHub and Modal.
+          sleep 60
+          pod=$(kubectl -n rgha get pods -l app=rgha -o jsonpath='{.items[0].metadata.name}')
+          restarts=$(kubectl -n rgha get pod "$pod" -o jsonpath='{.status.containerStatuses[0].restartCount}')
+          ready=$(kubectl -n rgha get pod "$pod" -o jsonpath='{.status.containerStatuses[0].ready}')
+          if [ "$restarts" != 0 ] || [ "$ready" != true ]; then
+            echo "::error::controller restarted $restarts time(s), ready=$ready"
+            kubectl -n rgha logs "$pod" --tail=50 || true
+            kubectl -n rgha logs "$pod" --previous --tail=50 || true
+            exit 1
+          fi
+          kubectl -n rgha logs "$pod" --tail=20

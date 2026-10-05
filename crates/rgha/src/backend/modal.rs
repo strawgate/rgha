@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use rgha_modal::{Client, Profile, SandboxSpec};
 use tokio::sync::OnceCell;
 
-use super::{Backend, Instance, JIT_ENV, Network, RUNNER_ENTRYPOINT, RunnerSpec, Usage};
+use super::{Backend, Instance, JIT_ENV, Network, RunnerSpec, Usage};
 
 const TAG_OWNER: &str = "rgha";
 const TAG_CLASS: &str = "rgha-class";
@@ -40,17 +40,31 @@ pub struct ModalSettings<'a> {
 }
 
 /// Layered on the runner image when `docker = true`. The official image
-/// already ships static dockerd/containerd/runc; bridge networking needs iptables.
+/// already ships static dockerd/containerd/runc; bridge networking needs
+/// iptables, and GitHub-hosted parity needs the Compose v2 plugin (gh-aw's
+/// firewall runs `docker compose`).
 pub(crate) const DOCKER_IMAGE_COMMANDS: &[&str] = &[
     "USER root",
     "RUN apt-get update && apt-get install -y --no-install-recommends iptables && rm -rf /var/lib/apt/lists/*",
+    "RUN mkdir -p /usr/local/lib/docker/cli-plugins && curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-compose https://github.com/docker/compose/releases/download/v5.6.0/docker-compose-linux-x86_64 && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose",
 ];
 
-/// Starts dockerd, waits up to ~30s for it, then hands over to the runner.
-pub(crate) const DOCKER_ENTRYPOINT: &str = "dockerd >/tmp/dockerd.log 2>&1 & \
-for i in $(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 0.5; done; \
-docker info >/dev/null 2>&1 || { echo 'dockerd failed to start' >&2; tail -50 /tmp/dockerd.log >&2; }; \
+/// Modal starts the entrypoint as root, with `PYTHONPATH=/pkg/:/root/` (which
+/// breaks pip for other users). Jobs expect GitHub-hosted semantics: the
+/// `runner` user with passwordless sudo. That only works where setuid does:
+/// gVisor sets no_new_privs, so there the runner stays root and root gets a
+/// sudoers entry (the image has none, so `sudo` would fail even as root).
+pub(crate) const RUN_AS_RUNNER: &str = "unset PYTHONPATH; export HOME=/home/runner; \
+if [ \"$(id -u)\" = 0 ] && id runner >/dev/null 2>&1 && ! grep -q '^NoNewPrivs:[[:space:]]*1' /proc/self/status; then \
+exec setpriv --reuid=\"$(id -u runner)\" --regid=\"$(id -g runner)\" --init-groups \
+env USER=runner LOGNAME=runner /home/runner/run.sh; fi; \
+if [ \"$(id -u)\" = 0 ]; then echo 'root ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers; fi; \
 exec /home/runner/run.sh";
+
+/// Starts dockerd, waits up to ~30s for it, then hands over to the runner.
+pub(crate) const DOCKER_START: &str = "dockerd >/tmp/dockerd.log 2>&1 & \
+for i in $(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 0.5; done; \
+docker info >/dev/null 2>&1 || { echo 'dockerd failed to start' >&2; tail -50 /tmp/dockerd.log >&2; }; ";
 
 impl ModalBackend {
     pub async fn connect(name: &str, s: ModalSettings<'_>) -> anyhow::Result<Self> {
@@ -105,11 +119,11 @@ pub fn sandbox_spec(
     SandboxSpec {
         name: spec.name.clone(),
         image_id: image_id.to_string(),
-        command: if docker {
-            vec!["/bin/bash".into(), "-c".into(), DOCKER_ENTRYPOINT.into()]
-        } else {
-            vec![RUNNER_ENTRYPOINT.to_string()]
-        },
+        command: vec![
+            "/bin/bash".into(),
+            "-c".into(),
+            if docker { format!("{DOCKER_START}{RUN_AS_RUNNER}") } else { RUN_AS_RUNNER.to_string() },
+        ],
         workdir: Some("/home/runner".into()),
         // The JIT config travels in an ephemeral Secret, not in the Sandbox
         // definition. It is single-use and bound to this one runner.
@@ -200,9 +214,10 @@ mod tests {
             network: Network::Allowlist { domains: vec!["github.com".into()], cidrs: vec![] },
         };
         let sb = sandbox_spec(&spec, "im-1", None, vec![], false);
-        assert_eq!(sb.command, vec![RUNNER_ENTRYPOINT.to_string()]);
+        assert_eq!(sb.command[2], RUN_AS_RUNNER);
+        assert!(!sb.command[2].contains("dockerd"));
         let docker = sandbox_spec(&spec, "im-1", Some("vm".into()), vec![], true);
-        assert!(docker.command[2].contains("dockerd") && docker.command[2].ends_with("exec /home/runner/run.sh"));
+        assert!(docker.command[2].starts_with("dockerd") && docker.command[2].ends_with(RUN_AS_RUNNER));
         assert_eq!(sb.secret_env.get(JIT_ENV).map(String::as_str), Some("SECRET"));
         assert!(!sb.command.iter().any(|a| a.contains("SECRET")));
         assert!(!sb.tags.values().any(|v| v.contains("SECRET")));

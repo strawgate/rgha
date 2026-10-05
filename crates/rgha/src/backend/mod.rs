@@ -91,6 +91,18 @@ pub trait Backend: Send + Sync {
     async fn wait(&self, id: &str) -> anyhow::Result<Option<i32>>;
     /// Live instances previously started for `class` (for orphan cleanup).
     async fn list(&self, class: &str) -> anyhow::Result<Vec<Instance>>;
+    /// Billed resource usage of an instance, if the platform meters it.
+    async fn usage(&self, _id: &str) -> anyhow::Result<Option<Usage>> {
+        Ok(None)
+    }
+}
+
+/// Billed quantities as metered by the platform (Modal reports the higher of
+/// request and actual use, already integrated over the sandbox's lifetime).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Usage {
+    pub cpu_core_secs: f64,
+    pub mem_gib_secs: f64,
 }
 
 /// Accepts a bare key or a `NAME=value` line (dotenv style); the last

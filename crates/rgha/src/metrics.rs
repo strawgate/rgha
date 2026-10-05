@@ -22,6 +22,7 @@ pub fn install(addr: SocketAddr) -> anyhow::Result<()> {
     describe_counter!("rgha_policy_rejections_total", "Jobs rejected by class policy");
     describe_counter!("rgha_orphans_stopped_total", "Leaked instances stopped by reconciliation");
     describe_gauge!("rgha_cost_usd_total", "Estimated sandbox spend (upper bound at cpu_limit)");
+    describe_gauge!("rgha_metered_cost_usd_total", "Sandbox spend from the platform's own usage meter");
     describe_gauge!(
         "rgha_github_equivalent_usd_total",
         "What the same jobs would cost on per-minute GitHub-hosted runners"
@@ -45,6 +46,10 @@ pub fn job_finished(class: &str, result: &str, job_secs: Option<f64>, sandbox_se
     histogram!("rgha_sandbox_seconds", "class" => c.clone()).record(sandbox_secs);
     gauge!("rgha_cost_usd_total", "class" => c.clone()).increment(usd);
     gauge!("rgha_github_equivalent_usd_total", "class" => c).increment(github_usd);
+}
+
+pub fn metered(class: &str, usd: f64) {
+    gauge!("rgha_metered_cost_usd_total", "class" => class.to_string()).increment(usd);
 }
 
 pub fn runner_started(class: &str, secs: f64) {

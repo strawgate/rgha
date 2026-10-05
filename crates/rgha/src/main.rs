@@ -68,7 +68,7 @@ enum Cmd {
         /// Sandbox overhead (boot + runner registration) in seconds.
         #[arg(long, default_value_t = 10.0)]
         overhead: f64,
-        /// Modal physical cores.
+        /// Modal cores.
         #[arg(long, default_value_t = 0.25)]
         cpu: f64,
         #[arg(long, default_value_t = 1024)]

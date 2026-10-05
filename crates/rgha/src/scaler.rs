@@ -3,13 +3,14 @@
 //! idle runners, reconciles leaked instances, and keeps a cost ledger.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike, Utc};
 use futures::future::join_all;
 use rgha_scaleset::{Client, JobMessageBase, MessageSession, ScaleSetMessage, Statistics};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use crate::backend::{Backend, Network, RunnerSpec};
 use crate::config::ClassConfig;
@@ -19,6 +20,8 @@ use crate::policy::{Actors, Decision, JobContext};
 use crate::pool::{AdaptiveWarm, Departed, Pool, State};
 
 /// How often to look for instances the pool doesn't know about.
+/// Wait after a runner departs before reading its usage meter.
+const METER_SETTLE: Duration = Duration::from_millis(if cfg!(test) { 1 } else { 10_000 });
 const RECONCILE_EVERY: Duration = Duration::from_secs(5 * 60);
 /// How long to wait for JobCompleted after a busy runner's instance exits.
 const EXIT_GRACE: Duration = Duration::from_secs(120);
@@ -82,6 +85,9 @@ pub struct ClassScaler {
     /// Set when the class uses `warm_max` (adaptive warm pool).
     adaptive: Option<AdaptiveWarm>,
     pub ledger: Ledger,
+    /// Platform-metered spend, filled in asynchronously after each runner departs.
+    pub metered_usd: Arc<Mutex<f64>>,
+    meters: JoinSet<()>,
 }
 
 impl ClassScaler {
@@ -122,6 +128,8 @@ impl ClassScaler {
             warm: false,
             adaptive,
             ledger: Ledger::default(),
+            metered_usd: Arc::default(),
+            meters: JoinSet::new(),
         }
     }
 
@@ -250,6 +258,34 @@ impl ClassScaler {
             github_equiv_usd = format!("{:.4}", self.ledger.github_usd),
             "runner finished"
         );
+        self.meter_in_background(d.runner.name.clone(), d.runner.instance_id.clone(), usd, sandbox_secs);
+    }
+
+    /// Fetches the platform's billed usage once its meter has settled, and
+    /// logs the real cost next to the estimate.
+    fn meter_in_background(&mut self, runner: String, instance_id: String, estimate_usd: f64, sandbox_secs: f64) {
+        let (backend, pricing, class) = (self.backend.clone(), self.pricing, self.class.name.clone());
+        let total = self.metered_usd.clone();
+        while self.meters.try_join_next().is_some() {}
+        self.meters.spawn(async move {
+            tokio::time::sleep(METER_SETTLE).await;
+            match backend.usage(&instance_id).await {
+                Ok(Some(u)) => {
+                    let usd = pricing.metered(u.cpu_core_secs, u.mem_gib_secs);
+                    metrics::metered(&class, usd);
+                    *total.lock().unwrap() += usd;
+                    tracing::info!(%class, %runner, %instance_id,
+                        sandbox_secs = format!("{sandbox_secs:.1}"),
+                        cpu_core_secs = format!("{:.2}", u.cpu_core_secs),
+                        mem_gib_secs = format!("{:.2}", u.mem_gib_secs),
+                        metered_usd = format!("{usd:.6}"),
+                        estimate_usd = format!("{estimate_usd:.6}"),
+                        "runner metered");
+                }
+                Ok(None) => {}
+                Err(e) => tracing::debug!(%instance_id, error = %e, "usage unavailable"),
+            }
+        });
     }
 
     fn stop_in_background(&self, instance_id: String) {
@@ -422,6 +458,9 @@ impl ClassScaler {
         if busy > 0 {
             tracing::warn!(class = %self.class.name, busy, "leaving busy runners to finish their jobs");
         }
+        // Let in-flight usage reads land so the session summary is complete.
+        let _ =
+            tokio::time::timeout(METER_SETTLE * 3, async { while self.meters.join_next().await.is_some() {} }).await;
     }
 
     /// Applies `warm_for_secs`: the warm pool only exists for a while after

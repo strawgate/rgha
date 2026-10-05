@@ -19,7 +19,7 @@ use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use super::ClassScaler;
-use crate::backend::{Backend, Instance, RunnerSpec};
+use crate::backend::{Backend, Instance, RunnerSpec, Usage};
 use crate::config::ClassConfig;
 use crate::cost::Pricing;
 
@@ -123,6 +123,9 @@ impl Backend for FakeBackend {
             .filter(|(_, i)| i.running && i.class == class)
             .map(|(id, i)| Instance { id: id.clone(), runner_name: i.runner_name.clone() })
             .collect())
+    }
+    async fn usage(&self, _id: &str) -> anyhow::Result<Option<Usage>> {
+        Ok(Some(Usage { cpu_core_secs: 2.0, mem_gib_secs: 4.0 }))
     }
 }
 
@@ -287,6 +290,8 @@ async fn assigned_jobs_start_runners_and_completed_jobs_stop_them() {
     assert_eq!(h.backend.running(), vec![running[1].clone()], "completed job's sandbox stopped");
     assert_eq!(s.ledger.jobs, 1);
     assert!((s.ledger.job_secs - 10.0).abs() < 1e-9, "duration from GitHub timestamps");
+    let metered = *s.metered_usd.lock().unwrap();
+    assert!((metered - Pricing::MODAL_SANDBOX.metered(2.0, 4.0)).abs() < 1e-12, "platform meter read once: {metered}");
 }
 
 #[tokio::test]

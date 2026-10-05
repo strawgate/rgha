@@ -88,9 +88,15 @@ impl ClassController {
             }
         }
         scaler.shutdown().await;
-        if let Some(r) = scaler.ledger.savings_ratio().filter(|_| scaler.ledger.jobs > 0) {
+        let metered = *scaler.metered_usd.lock().unwrap();
+        if metered > 0.0 && scaler.ledger.jobs > 0 {
+            let r = scaler.ledger.github_usd / metered;
+            tracing::info!(class = %self.class.name, jobs = scaler.ledger.jobs, metered_usd = metered,
+                estimate_usd = scaler.ledger.sandbox_usd, github_equiv_usd = scaler.ledger.github_usd,
+                "session savings (metered): {r:.1}x cheaper than GitHub-hosted");
+        } else if let Some(r) = scaler.ledger.savings_ratio().filter(|_| scaler.ledger.jobs > 0) {
             tracing::info!(class = %self.class.name, jobs = scaler.ledger.jobs, cost_usd = scaler.ledger.sandbox_usd,
-                github_equiv_usd = scaler.ledger.github_usd, "session savings: {r:.1}x cheaper than GitHub-hosted");
+                github_equiv_usd = scaler.ledger.github_usd, "session savings (estimated): {r:.1}x cheaper than GitHub-hosted");
         }
         Ok(())
     }

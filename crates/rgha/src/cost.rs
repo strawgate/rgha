@@ -7,7 +7,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pricing {
-    /// USD per CPU unit per second, in the backend's CPU unit (Modal: physical core).
+    /// USD per CPU unit per second, in the backend's CPU unit (Modal: core, metered as CPU-seconds used).
     pub cpu_per_sec: f64,
     /// USD per GiB of memory per second.
     pub gib_per_sec: f64,
@@ -23,6 +23,11 @@ impl Pricing {
     /// Daytona list prices per vCPU-second and GiB-second (daytona.io/pricing,
     /// checked 2026-10). Daytona allocates whole vCPUs and GiB.
     pub const DAYTONA: Pricing = Pricing { cpu_per_sec: 0.000_014, gib_per_sec: 0.000_004_5, min_billed_secs: 0.0 };
+
+    /// Cost of metered core-seconds and GiB-seconds.
+    pub fn metered(&self, cpu_core_secs: f64, mem_gib_secs: f64) -> f64 {
+        cpu_core_secs * self.cpu_per_sec + mem_gib_secs * self.gib_per_sec
+    }
 
     pub fn cost(&self, cpu: f64, memory_mib: u32, secs: f64) -> f64 {
         let billed = secs.max(self.min_billed_secs).max(0.0);

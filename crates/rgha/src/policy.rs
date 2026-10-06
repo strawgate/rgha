@@ -88,7 +88,7 @@ pub enum Decision {
 }
 
 impl Policy {
-    fn fork_prs_allowed(&self) -> bool {
+    pub(crate) fn fork_prs_allowed(&self) -> bool {
         self.allow_fork_prs.unwrap_or(self.trust == Trust::Untrusted)
     }
 

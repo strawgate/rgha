@@ -625,3 +625,24 @@ async fn actor_lookup_failure_fails_closed() {
     assert!(h.backend.running().is_empty());
     assert_eq!(h.requests_to("/actions/runs/4242/cancel").await, 1);
 }
+
+#[tokio::test]
+async fn warm_schedule_sets_the_floor_while_open() {
+    // Two windows covering the whole day (the second wraps past midnight),
+    // so this holds at any time it runs.
+    const ALL_DAY: &str = "[[warm_schedule]]\nfrom = \"00:00\"\nto = \"12:00\"\nmin_idle = 2\n\
+                           [[warm_schedule]]\nfrom = \"12:00\"\nto = \"00:00\"\nmin_idle = 2";
+    let h = Harness::new().await;
+    let mut s = h.scaler(class(&format!("min_idle = 0\n{ALL_DAY}")));
+    s.scale(&h.session, None).await.unwrap();
+    settle().await;
+    assert_eq!(h.backend.running().len(), 2, "schedule floor applied with no jobs queued");
+
+    // With the adaptive pool, the schedule raises its floor.
+    let h = Harness::new().await;
+    let mut s = h.scaler(class(&format!("min_idle = 0\nwarm_max = 4\n{ALL_DAY}")));
+    s.scale(&h.session, None).await.unwrap();
+    settle().await;
+    assert_eq!(s.adaptive.as_ref().map(|a| a.target()), Some(2));
+    assert_eq!(h.backend.running().len(), 2);
+}

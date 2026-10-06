@@ -6,12 +6,14 @@ mod backend;
 mod config;
 mod controller;
 mod cost;
+mod hook;
 mod image;
 mod lab;
 mod metrics;
 mod policy;
 mod pool;
 mod scaler;
+mod schedule;
 
 use std::collections::HashMap;
 use std::path::PathBuf;

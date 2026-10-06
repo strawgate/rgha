@@ -89,9 +89,29 @@ and jobs can still burst.
   pickup; quiet periods cost nothing. With `warm_for_secs = 600`, the pool
   switched off 10 minutes after the last job, and that idle runner had cost
   $0.004.
-- Trusted classes refuse `min_idle > 0` unless `allow_warm_trusted = true`.
-  GitHub assigns jobs to a scale set before rgha can check them, so a warm
-  runner could start a disallowed job before rgha cancels it.
+- `warm_schedule` keeps a different warm pool in time windows, for example
+  more runners during working hours, when CI fans out, and none at night:
+  ```toml
+  [[class.warm_schedule]]
+  days = ["mon", "tue", "wed", "thu", "fri"]
+  from = "08:00"
+  to = "18:00"                  # exclusive; earlier than `from` wraps past midnight
+  timezone = "America/Chicago"  # IANA name, DST-aware; default UTC
+  min_idle = 4
+  ```
+  The largest open window wins; outside every window the class `min_idle`
+  applies. With `warm_max`, the window raises the adaptive pool's floor.
+- Trusted classes refuse a warm pool (`min_idle`, `warm_max` or
+  `warm_schedule`) unless `allow_warm_trusted = true`. GitHub assigns jobs
+  to a scale set before rgha can check them, so a warm runner could pick up
+  a disallowed job before rgha cancels its run. The job-started hook closes
+  that gap.
+- `job_started_hook` (default on, Modal backend) installs a runner
+  job-started hook that re-checks the class policy inside the sandbox before
+  any step runs: event, workflow ref, repository, actors, and whether a PR
+  comes from a fork, read from the job's own event payload. A rejected job
+  fails before its steps start. Its logic is tested for parity with the
+  controller's policy over a matrix of over 1,000 cases.
 - `docker = true` on a `runtime = "vm"` Modal backend starts `dockerd` before
   the runner. Cold pickup was about 10 s.
 

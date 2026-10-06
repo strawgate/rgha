@@ -101,6 +101,10 @@ and jobs can still burst.
   ```
   The largest open window wins; outside every window the class `min_idle`
   applies. With `warm_max`, the window raises the adaptive pool's floor.
+- Warm runners idle longer than `warm_max_age_secs` (default 30 min) are
+  replaced with fresh ones. The sandbox lifetime covers that idle time plus a
+  full `max_job_minutes`, so a runner that picks up a job just before rotation
+  still gets the whole job budget.
 - Trusted classes refuse a warm pool (`min_idle`, `warm_max` or
   `warm_schedule`) unless `allow_warm_trusted = true`. GitHub assigns jobs
   to a scale set before rgha can check them, so a warm runner could pick up

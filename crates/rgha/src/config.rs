@@ -174,6 +174,12 @@ pub struct ClassConfig {
     /// Seconds an idle surplus runner may live before being reaped.
     #[serde(default = "default_idle_ttl")]
     pub idle_ttl_secs: u64,
+    /// Warm runners idle longer than this are replaced with fresh ones. The
+    /// sandbox lifetime covers this idle time plus a full `max_job_minutes`,
+    /// so a runner that picks up a job just before rotation still gets the
+    /// whole job budget.
+    #[serde(default = "default_warm_max_age")]
+    pub warm_max_age_secs: u64,
     #[serde(default)]
     pub network: NetworkMode,
     #[serde(default)]
@@ -197,6 +203,9 @@ pub struct ClassConfig {
 
 fn default_true() -> bool {
     true
+}
+fn default_warm_max_age() -> u64 {
+    30 * 60
 }
 fn default_warm_grow_secs() -> u64 {
     60
@@ -263,7 +272,7 @@ impl ClassConfig {
 
     /// Sandbox lifetime cap: max job time plus slack for boot and idle wait.
     pub fn sandbox_timeout(&self) -> Duration {
-        self.max_job() + Duration::from_secs(self.idle_ttl_secs.max(60) + 120)
+        self.max_job() + Duration::from_secs(self.idle_ttl_secs.max(self.warm_max_age_secs).max(60) + 120)
     }
 }
 
@@ -373,6 +382,13 @@ mod tests {
         let cfg: Config = toml::from_str(EXAMPLE).unwrap();
         cfg.validate().unwrap();
         assert!(cfg.classes.len() >= 2);
+    }
+
+    #[test]
+    fn sandbox_lifetime_covers_warm_idle_plus_a_full_job() {
+        let c: ClassConfig =
+            toml::from_str("name = \"c\"\nbackend = \"b\"\nmax_job_minutes = 15\nwarm_max_age_secs = 1800").unwrap();
+        assert!(c.sandbox_timeout() >= Duration::from_secs(15 * 60 + 1800 + 60));
     }
 
     #[test]

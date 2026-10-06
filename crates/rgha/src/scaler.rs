@@ -404,7 +404,16 @@ impl ClassScaler {
 
     async fn reap(&mut self) {
         let ttl = Duration::from_secs(self.class.idle_ttl_secs);
-        for name in self.pool.reap_candidates(self.assigned(), ttl, Instant::now()) {
+        let now = Instant::now();
+        let surplus = self.pool.reap_candidates(self.assigned(), ttl, now);
+        let rotate = self.pool.rotation_candidates(Duration::from_secs(self.class.warm_max_age_secs), now);
+        let mut seen = std::collections::HashSet::new();
+        for (name, why) in
+            surplus.into_iter().map(|n| (n, "reaped idle")).chain(rotate.into_iter().map(|n| (n, "rotated")))
+        {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
             let Some(r) = self.pool.get(&name).cloned() else { continue };
             // Deregister first: the service refuses if the runner just took a
             // job, which closes the race between "idle" and "assigned".
@@ -417,7 +426,7 @@ impl ClassScaler {
                 }
             }
             if let Some(d) = self.pool.remove(&name, Instant::now()) {
-                self.record(&d, "reaped idle", None);
+                self.record(&d, why, None);
                 self.stop_in_background(d.runner.instance_id);
             }
         }

@@ -646,3 +646,43 @@ async fn warm_schedule_sets_the_floor_while_open() {
     assert_eq!(s.adaptive.as_ref().map(|a| a.target()), Some(2));
     assert_eq!(h.backend.running().len(), 2);
 }
+
+#[tokio::test]
+async fn warm_runners_are_rotated_before_their_sandbox_lifetime_runs_short() {
+    let h = Harness::new().await;
+    h.remove_runner(false).await;
+    let mut s = h.scaler(class("min_idle = 1\nwarm_max_age_secs = 1"));
+    s.scale(&h.session, None).await.unwrap();
+    settle().await;
+    let first = h.backend.running();
+    assert_eq!(first.len(), 1, "one warm runner");
+
+    // Still young: not rotated.
+    s.scale(&h.session, None).await.unwrap();
+    settle().await;
+    assert_eq!(h.backend.running(), first);
+
+    // Past warm_max_age: replaced by a fresh runner, pool size unchanged.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    s.scale(&h.session, None).await.unwrap();
+    s.scale(&h.session, None).await.unwrap();
+    settle().await;
+    let now = h.backend.running();
+    assert_eq!(now.len(), 1, "still one warm runner");
+    assert_ne!(now, first, "the old runner was rotated out");
+}
+
+#[tokio::test]
+async fn busy_runners_are_never_rotated() {
+    let h = Harness::new().await;
+    h.remove_runner(true).await;
+    let mut s = h.scaler(class("min_idle = 1\nwarm_max_age_secs = 1"));
+    s.scale(&h.session, None).await.unwrap();
+    settle().await;
+    let first = h.backend.running();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // The service refuses to deregister it (it just took a job): it stays.
+    s.scale(&h.session, None).await.unwrap();
+    settle().await;
+    assert_eq!(h.backend.running(), first);
+}

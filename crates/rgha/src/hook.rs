@@ -102,7 +102,9 @@ pub fn job_started_script(policy: &Policy) -> String {
     format!(
         "#!/usr/bin/env bash\n\
          # rgha job-started hook: re-checks the class policy before any step runs.\n\
-         node=\"${{RGHA_NODE:-$(ls -d /home/runner/externals/node*/bin/node 2>/dev/null | sort -V | tail -1)}}\"\n\
+         # The runner ships glibc and musl (node*_alpine) builds; only the glibc one runs here.\n\
+         ext=\"${{RGHA_EXTERNALS:-/home/runner/externals}}\"\n\
+         node=\"${{RGHA_NODE:-$(ls -d \"$ext\"/node*/bin/node 2>/dev/null | grep -v _alpine/ | sort -V | tail -1)}}\"\n\
          if [ ! -x \"$node\" ]; then echo '::error::rgha: no Node.js runtime for the policy hook'; exit 1; fi\n\
          exec \"$node\" - <<'RGHA_JS'\nconst P = {p};\n{DECIDE_FN}\n{MAIN_JS}\nRGHA_JS\n"
     )
@@ -283,5 +285,44 @@ mod tests {
         let script = job_started_script(&actors);
         assert!(hook_accepts(&script, &node, &pr("o"), &ctx("Alice", "alice")));
         assert!(!hook_accepts(&script, &node, &pr("o"), &ctx("alice", "bob")), "re-run by someone else");
+    }
+
+    /// The runner's externals hold glibc and musl (`node*_alpine`) builds;
+    /// the hook must pick the newest glibc one (regression: it picked
+    /// `node24_alpine`, which can't execute, and failed every job closed).
+    #[test]
+    fn hook_picks_the_glibc_node_build() {
+        let Some(node) = node() else { return };
+        let ext = std::env::temp_dir().join(format!("rgha-ext-{}", std::process::id()));
+        for (dir, body) in [
+            ("node20", "#!/bin/sh\nexit 98\n".to_string()),
+            ("node24", format!("#!/bin/sh\nexec {node} \"$@\"\n")),
+            ("node24_alpine", "#!/bin/sh\nexit 99\n".to_string()),
+        ] {
+            let bin = ext.join(dir).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let path = bin.join("node");
+            std::fs::write(&path, body).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let dir = std::env::temp_dir().join(format!("rgha-hook-ext-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("hook.sh");
+        std::fs::write(&script, job_started_script(&Policy::default())).unwrap();
+        let out = Command::new("bash")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("RGHA_EXTERNALS", &ext)
+            .env("GITHUB_EVENT_NAME", "push")
+            .env("GITHUB_WORKFLOW_REF", "o/r/.github/workflows/ci.yml@refs/heads/main")
+            .env("GITHUB_REPOSITORY", "o/r")
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&ext).ok();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(out.status.success(), "exit {:?}: {}", out.status.code(), String::from_utf8_lossy(&out.stdout));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("policy check passed"));
     }
 }

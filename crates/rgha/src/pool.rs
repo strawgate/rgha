@@ -148,6 +148,20 @@ impl Pool {
     }
 }
 
+impl Pool {
+    /// Idle runners older than `max_age` (since their sandbox started),
+    /// oldest first: rotated before their sandbox lifetime runs short.
+    pub fn rotation_candidates(&self, max_age: Duration, now: Instant) -> Vec<String> {
+        let mut old: Vec<&Runner> = self
+            .runners
+            .values()
+            .filter(|r| r.state == State::Idle && now.saturating_duration_since(r.created) >= max_age)
+            .collect();
+        old.sort_by_key(|r| r.created);
+        old.into_iter().map(|r| r.name.clone()).collect()
+    }
+}
+
 /// Adaptive warm-pool size: grows slowly while jobs keep starting cold,
 /// shrinks slowly once they stop. Additive in both directions, so one big
 /// burst nudges the pool up by one runner rather than by the burst size.

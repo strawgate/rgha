@@ -9,6 +9,8 @@ use async_trait::async_trait;
 use rgha_modal::{Client, Profile, SandboxSpec};
 use tokio::sync::OnceCell;
 
+use base64::Engine;
+
 use super::{Backend, Instance, JIT_ENV, Network, RunnerSpec, Usage};
 
 const TAG_OWNER: &str = "rgha";
@@ -54,7 +56,14 @@ pub(crate) const DOCKER_IMAGE_COMMANDS: &[&str] = &[
 /// `runner` user with passwordless sudo. That only works where setuid does:
 /// gVisor sets no_new_privs, so there the runner stays root and root gets a
 /// sudoers entry (the image has none, so `sudo` would fail even as root).
+/// Carries the job-started hook script (base64) into the sandbox.
+pub(crate) const HOOK_ENV: &str = "RGHA_JOB_STARTED_HOOK";
+
 pub(crate) const RUN_AS_RUNNER: &str = "unset PYTHONPATH; export HOME=/home/runner; \
+if [ -n \"${RGHA_JOB_STARTED_HOOK:-}\" ]; then \
+printf %s \"$RGHA_JOB_STARTED_HOOK\" | base64 -d > /tmp/rgha-job-started.sh && chmod 755 /tmp/rgha-job-started.sh \
+|| { echo 'rgha: cannot install the job-started hook' >&2; exit 1; }; \
+export ACTIONS_RUNNER_HOOK_JOB_STARTED=/tmp/rgha-job-started.sh; unset RGHA_JOB_STARTED_HOOK; fi; \
 if [ \"$(id -u)\" = 0 ] && id runner >/dev/null 2>&1 && ! grep -q '^NoNewPrivs:[[:space:]]*1' /proc/self/status; then \
 exec setpriv --reuid=\"$(id -u runner)\" --regid=\"$(id -g runner)\" --init-groups \
 env USER=runner LOGNAME=runner /home/runner/run.sh; fi; \
@@ -127,11 +136,17 @@ pub fn sandbox_spec(
         workdir: Some("/home/runner".into()),
         // The JIT config travels in an ephemeral Secret, not in the Sandbox
         // definition. It is single-use and bound to this one runner.
-        secret_env: HashMap::from([
-            (JIT_ENV.to_string(), spec.jit_config.clone()),
-            // Modal may run the entrypoint as root; the sandbox is the boundary.
-            ("RUNNER_ALLOW_RUNASROOT".to_string(), "1".to_string()),
-        ]),
+        secret_env: {
+            let mut env = HashMap::from([
+                (JIT_ENV.to_string(), spec.jit_config.clone()),
+                // Modal may run the entrypoint as root; the sandbox is the boundary.
+                ("RUNNER_ALLOW_RUNASROOT".to_string(), "1".to_string()),
+            ]);
+            if let Some(script) = &spec.job_started_hook {
+                env.insert(HOOK_ENV.to_string(), base64::engine::general_purpose::STANDARD.encode(script));
+            }
+            env
+        },
         cpu: spec.cpu,
         cpu_limit: Some(spec.cpu_limit),
         memory_mib: spec.memory_mib,
@@ -212,6 +227,7 @@ mod tests {
             memory_limit_mib: 2048,
             timeout: Duration::from_secs(600),
             network: Network::Allowlist { domains: vec!["github.com".into()], cidrs: vec![] },
+            job_started_hook: None,
         };
         let sb = sandbox_spec(&spec, "im-1", None, vec![], false);
         assert_eq!(sb.command[2], RUN_AS_RUNNER);
@@ -225,5 +241,32 @@ mod tests {
         assert_eq!((sb.memory_mib, sb.memory_limit_mib), (512, Some(2048)));
         assert!(matches!(sb.network, rgha_modal::Network::Allowlist { .. }));
         assert_eq!(sb.tags.get(TAG_CLASS).map(String::as_str), Some("c"));
+    }
+
+    /// The entrypoint installs the hook from the env var and refuses to
+    /// start the runner if it can't (fail closed).
+    #[test]
+    fn entrypoint_installs_the_job_started_hook() {
+        use base64::Engine as _;
+        // Run the real prelude, but print the hook instead of starting the runner.
+        let script =
+            RUN_AS_RUNNER.replace("exec /home/runner/run.sh", "cat \"$ACTIONS_RUNNER_HOOK_JOB_STARTED\"; exit 0");
+        let run = |hook: Option<&str>| {
+            let mut cmd = std::process::Command::new("bash");
+            cmd.arg("-c").arg(&script).env_remove(HOOK_ENV);
+            if let Some(h) = hook {
+                cmd.env(HOOK_ENV, h);
+            }
+            cmd.output().unwrap()
+        };
+        let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+        if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+            return; // as root the prelude edits /etc/sudoers; only run unprivileged
+        }
+        let ok = run(Some(&base64::engine::general_purpose::STANDARD.encode("#!/bin/bash\necho policy\n")));
+        assert!(ok.status.success());
+        assert_eq!(String::from_utf8_lossy(&ok.stdout), "#!/bin/bash\necho policy\n");
+        let bad = run(Some("!!! not base64 !!!"));
+        assert!(!bad.status.success(), "corrupt hook must stop the sandbox before the runner starts");
     }
 }

@@ -84,6 +84,10 @@ pub struct ClassScaler {
     warm: bool,
     /// Set when the class uses `warm_max` (adaptive warm pool).
     adaptive: Option<AdaptiveWarm>,
+    /// `warm_schedule` windows (validated at config load).
+    windows: Vec<crate::schedule::Window>,
+    /// Warm pool floor from the schedule, for logging changes.
+    scheduled_min_idle: u32,
     pub ledger: Ledger,
     /// Platform-metered spend, filled in asynchronously after each runner departs.
     pub metered_usd: Arc<Mutex<f64>>,
@@ -100,6 +104,8 @@ impl ClassScaler {
     ) -> Self {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let pool = Pool::new(class.min_idle, class.max_runners);
+        let windows = class.warm_windows().unwrap_or_default();
+        let scheduled_min_idle = class.min_idle;
         let adaptive = class.warm_max.map(|max| {
             AdaptiveWarm::new(
                 class.min_idle,
@@ -126,6 +132,8 @@ impl ClassScaler {
             last_reconcile: None,
             last_activity: None,
             warm: false,
+            windows,
+            scheduled_min_idle,
             adaptive,
             ledger: Ledger::default(),
             metered_usd: Arc::default(),
@@ -466,9 +474,15 @@ impl ClassScaler {
     /// Applies `warm_for_secs`: the warm pool only exists for a while after
     /// the last job activity. Surplus warm runners are then reaped normally.
     fn update_warm_pool(&mut self, now: Instant) {
+        let base = crate::schedule::min_idle_at(&self.windows, self.class.min_idle, chrono::Utc::now());
+        if base != self.scheduled_min_idle {
+            tracing::info!(class = %self.class.name, from = self.scheduled_min_idle, to = base, "warm schedule");
+            self.scheduled_min_idle = base;
+        }
         // Jobs waiting without a runner means they are starting cold.
         let cold = self.assigned() > self.pool.len() as i64;
         if let Some(adaptive) = &mut self.adaptive {
+            adaptive.set_floor(base);
             let before = adaptive.target();
             let target = adaptive.observe(cold, now);
             if target != before {
@@ -479,10 +493,10 @@ impl ClassScaler {
         }
         let warm = warm_active(self.class.warm_for_secs, self.last_activity, now);
         if warm != self.warm {
-            tracing::info!(class = %self.class.name, warm, min_idle = self.class.min_idle, "warm pool {}", if warm { "on" } else { "off" });
+            tracing::info!(class = %self.class.name, warm, min_idle = base, "warm pool {}", if warm { "on" } else { "off" });
             self.warm = warm;
         }
-        self.pool.min_idle = if warm { self.class.min_idle } else { 0 };
+        self.pool.min_idle = if warm { base } else { 0 };
     }
 
     fn publish_gauges(&self) {
@@ -617,6 +631,7 @@ async fn start_one(
         memory_limit_mib: class.memory_cap_mib(),
         timeout: class.sandbox_timeout(),
         network: Network::for_class(class),
+        job_started_hook: class.job_started_hook.then(|| crate::hook::job_started_script(&class.policy)),
     };
     match backend.start(&spec).await {
         Ok(instance_id) => Ok((spec, jit.runner.id, instance_id, t0.elapsed())),

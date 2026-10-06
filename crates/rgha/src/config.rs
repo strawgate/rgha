@@ -165,6 +165,10 @@ pub struct ClassConfig {
     /// Idle runners kept warm. 0 = pure scale-to-zero (cheapest).
     #[serde(default)]
     pub min_idle: u32,
+    /// Time windows with a different warm pool (e.g. more during working
+    /// hours). The largest open window wins; outside them, `min_idle`.
+    #[serde(default)]
+    pub warm_schedule: Vec<crate::schedule::WarmWindow>,
     #[serde(default = "default_max_job_minutes")]
     pub max_job_minutes: u64,
     /// Seconds an idle surplus runner may live before being reaped.
@@ -184,8 +188,16 @@ pub struct ClassConfig {
     /// See the min_idle check in `Config::validate`.
     #[serde(default)]
     pub allow_warm_trusted: bool,
+    /// Re-check the class policy inside the sandbox before any job step
+    /// runs (a runner job-started hook), so a job GitHub hands to a warm
+    /// runner before rgha can cancel it still never runs. Modal backend.
+    #[serde(default = "default_true")]
+    pub job_started_hook: bool,
 }
 
+fn default_true() -> bool {
+    true
+}
 fn default_warm_grow_secs() -> u64 {
     60
 }
@@ -233,6 +245,10 @@ pub const GITHUB_RUNNER_DOMAINS: &[&str] = &[
 ];
 
 impl ClassConfig {
+    pub fn warm_windows(&self) -> anyhow::Result<Vec<crate::schedule::Window>> {
+        self.warm_schedule.iter().map(|w| w.parse()).collect()
+    }
+
     pub fn cpu_cap(&self) -> f64 {
         self.cpu_limit.unwrap_or(self.cpu)
     }
@@ -291,7 +307,17 @@ impl Config {
                     bail!("class {:?}: use either warm_for_secs or warm_max (adaptive), not both", c.name);
                 }
             }
-            let may_warm = c.min_idle > 0 || c.warm_max.is_some_and(|m| m > 0);
+            let windows = c.warm_windows().with_context(|| format!("class {:?}: warm_schedule", c.name))?;
+            if let Some(w) = windows.iter().find(|w| w.min_idle > c.max_runners) {
+                bail!("class {:?}: a warm_schedule min_idle ({}) exceeds max_runners", c.name, w.min_idle);
+            }
+            if let Some(max) = c.warm_max
+                && windows.iter().any(|w| w.min_idle > max)
+            {
+                bail!("class {:?}: warm_max must be >= every warm_schedule min_idle", c.name);
+            }
+            let may_warm =
+                c.min_idle > 0 || c.warm_max.is_some_and(|m| m > 0) || windows.iter().any(|w| w.min_idle > 0);
             if c.policy.trust == crate::policy::Trust::Trusted && may_warm && !c.allow_warm_trusted {
                 bail!(
                     "class {:?}: trusted classes default to min_idle = 0. GitHub assigns jobs to a scale set before \
@@ -347,6 +373,30 @@ mod tests {
         let cfg: Config = toml::from_str(EXAMPLE).unwrap();
         cfg.validate().unwrap();
         assert!(cfg.classes.len() >= 2);
+    }
+
+    #[test]
+    fn warm_schedule_validation() {
+        let cfg = |class_extra: &str| {
+            toml::from_str::<Config>(&format!(
+                "[github]\nurl = \"https://github.com/o\"\n[backends.m]\ntype = \"modal\"\napp = \"a\"\n\
+                 [[class]]\nname = \"c\"\nbackend = \"m\"\nmax_runners = 3\n{class_extra}"
+            ))
+            .unwrap()
+            .validate()
+        };
+        let window = |n: u32| {
+            format!(
+                "[[class.warm_schedule]]\nfrom = \"08:00\"\nto = \"18:00\"\ntimezone = \"America/Chicago\"\nmin_idle = {n}\n"
+            )
+        };
+        assert!(cfg(&window(2)).is_ok());
+        assert!(cfg(&window(4)).is_err(), "window min_idle above max_runners");
+        assert!(cfg(&format!("warm_max = 1\n{}", window(2))).is_err(), "window min_idle above warm_max");
+        let trusted = "[class.policy]\ntrust = \"trusted\"\n";
+        assert!(cfg(&format!("{}{trusted}", window(1))).is_err(), "trusted + schedule needs allow_warm_trusted");
+        assert!(cfg(&format!("allow_warm_trusted = true\n{}{trusted}", window(1))).is_ok());
+        assert!(cfg("[[class.warm_schedule]]\nfrom = \"8\"\nto = \"18:00\"\nmin_idle = 1\n").is_err(), "bad time");
     }
 
     #[test]

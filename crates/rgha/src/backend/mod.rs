@@ -53,6 +53,9 @@ pub struct RunnerSpec {
     pub memory_limit_mib: u32,
     pub timeout: Duration,
     pub network: Network,
+    /// Job-started hook script (see `crate::hook`); backends that support it
+    /// install it so the runner runs it before any job step.
+    pub job_started_hook: Option<String>,
 }
 
 impl std::fmt::Debug for RunnerSpec {

@@ -292,6 +292,7 @@ mod tests {
             memory_limit_mib: 1536,
             timeout: Duration::from_secs(61 * 60),
             network,
+            job_started_hook: None,
         }
     }
 

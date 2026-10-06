@@ -172,6 +172,15 @@ impl AdaptiveWarm {
         self.target
     }
 
+    /// Moves the floor (e.g. a warm_schedule window opening or closing).
+    /// Raising it lifts the target at once; lowering it lets the target
+    /// shrink back gradually.
+    pub fn set_floor(&mut self, floor: u32) {
+        self.floor = floor;
+        self.max = self.max.max(floor);
+        self.target = self.target.max(floor);
+    }
+
     /// Updates the target given whether jobs are waiting without a runner.
     pub fn observe(&mut self, cold_starts: bool, now: Instant) -> u32 {
         if cold_starts {

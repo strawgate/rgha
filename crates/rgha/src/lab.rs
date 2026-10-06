@@ -60,6 +60,7 @@ pub async fn hibernate_prepare(cfg: &Config, gh: &rgha_scaleset::Client, class_n
         memory_limit_mib: class.memory_cap_mib(),
         timeout: Duration::from_secs(3600),
         network: Network::for_class(class),
+        job_started_hook: None,
     };
     let mut sb = crate::backend::modal_sandbox_spec(&spec, &image_id, runtime.clone(), regions.clone(), *docker);
     sb.enable_snapshot = true;

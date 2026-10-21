@@ -2,3 +2,6 @@
 *.pem
 .env
 /rgha.toml
+
+# Public roots the image distrusts (certs/distrust.sh), not secrets.
+!certs/distrusted/*.pem

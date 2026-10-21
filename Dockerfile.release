@@ -1,8 +1,17 @@
 # Release image: packages the binaries built natively by the release workflow
 # (no in-image compile, no QEMU). Linux binaries are built on Ubuntu 22.04
 # (glibc 2.35), which runs on distroless Debian 12 (glibc 2.36).
-FROM gcr.io/distroless/cc-debian12:nonroot
+# The base is pinned; see Dockerfile.
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
+
+FROM busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e AS certs
+COPY --from=runtime /etc/ssl/certs/ca-certificates.crt /bundle.crt
+COPY certs/ /certs/
+RUN sh /certs/distrust.sh /bundle.crt /certs/distrusted/*.pem > /ca-certificates.crt
+
+FROM runtime
 ARG TARGETARCH
+COPY --from=certs /ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY dist/${TARGETARCH}/rgha /usr/local/bin/rgha
 ENV RGHA_CONFIG=/etc/rgha/rgha.toml \
     RGHA_METRICS_ADDR=0.0.0.0:9464
